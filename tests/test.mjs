@@ -141,7 +141,12 @@ const EVENT = {
 const handlers = new Map();
 const promptCalls = [];
 const variableWrites = [];
+const variableDeletes = [];
 const toastLog = [];
+const scriptButtons = [
+    { name: '我醒了', visible: true },
+    { name: '校正计数', visible: true },
+];
 const oldCycle = {
     cycle_id: 'legacy-cycle',
     start_message_id: 2,
@@ -263,6 +268,24 @@ const context = {
         variableWrites.push(copy);
         chatVariables = { ...chatVariables, ...copy };
     },
+    deleteVariable(variablePath, option) {
+        const deleteOccurred = Object.hasOwn(chatVariables, variablePath);
+        if (deleteOccurred) {
+            delete chatVariables[variablePath];
+        }
+        variableDeletes.push({ variablePath, option: structuredClone(option), deleteOccurred });
+        return {
+            variables: structuredClone(chatVariables),
+            delete_occurred: deleteOccurred,
+        };
+    },
+    appendInexistentScriptButtons(buttons) {
+        for (const button of buttons) {
+            if (!scriptButtons.some(current => current.name === button.name)) {
+                scriptButtons.push(structuredClone(button));
+            }
+        }
+    },
     getButtonEvent: name => `button:${name}`,
     eventOn(event, handler) {
         handlers.set(event, handler);
@@ -302,6 +325,11 @@ vm.runInContext(`${source}\n;globalThis.__counterV5 = {
 };`, context);
 
 const api = context.__counterV5;
+assert.deepEqual(scriptButtons, [
+    { name: '我醒了', visible: true },
+    { name: '校正计数', visible: true },
+    { name: '结束清醒', visible: true },
+]);
 
 async function flushTasks() {
     await Promise.resolve();
@@ -419,6 +447,8 @@ assert.deepEqual(
 assert.equal(block.children[2].textContent, '[message_id: #4 | since_wake: #2]');
 assert.equal(reasoningNode.textContent, reasoningBeforeRender);
 assert.equal(textNode.textContent, textBeforeRender);
+api.renderMessage(messageElement, 4, chat[4], null);
+assert.equal(block.children[2].textContent, '[message_id: #4]');
 api.renderMessage(messageElement, 2, chat[2], null);
 assert.equal(block.children.some(node => node.classList.contains('st-awake-message-coordinate-footer')), false);
 
@@ -545,6 +575,31 @@ assert.equal(variableWrites.length, 1);
 await runHandlerWithoutChatMutation('button:校正计数');
 assert.equal(variableWrites.length, 1);
 
+// Ending awake deletes the state and suppresses all prompt coordinates until the next wake.
+await runHandlerWithoutChatMutation('button:结束清醒');
+assert.equal(variableDeletes.length, 1);
+assert.deepEqual(variableDeletes[0], {
+    variablePath: 'st_awake_message_counter',
+    option: { type: 'chat' },
+    deleteOccurred: true,
+});
+assert.equal(chatVariables.st_awake_message_counter, undefined);
+assert.equal(lastPromptCall()[1], '');
+
+textarea.value = 'message while awake tracking is off';
+await runHandlerWithoutChatMutation(EVENT.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+assert.equal(lastPromptCall()[1], '');
+textarea.value = '';
+
+// Repeated ending is a no-op; waking again creates a fresh cycle at #1.
+await runHandlerWithoutChatMutation('button:结束清醒');
+assert.equal(variableDeletes.length, 1);
+await runHandlerWithoutChatMutation('button:我醒了');
+assert.equal(variableWrites.length, 2);
+assert.equal(chatVariables.st_awake_message_counter.version, 2);
+assert.equal(chatVariables.st_awake_message_counter.cycles.length, 1);
+assert.equal(chatVariables.st_awake_message_counter.start_message_id, chat.length);
+
 // Quiet and dry-run generations clear/skip the coordinate prompt.
 await runHandlerWithoutChatMutation(EVENT.GENERATION_AFTER_COMMANDS, 'quiet', {}, false);
 assert.equal(lastPromptCall()[1], '');
@@ -557,6 +612,8 @@ process.stdout.write(JSON.stringify({
     countAfterDeletion: deletedIndex.currentCount,
     promptCalls: promptCalls.length,
     variableWrites: variableWrites.length,
+    variableDeletes: variableDeletes.length,
+    scriptButtons: scriptButtons.map(button => button.name),
     migratedCycles: migrated.cycles.length,
     reasoningPreserved: true,
     footerPlacement: block.children.map(node => node.className),

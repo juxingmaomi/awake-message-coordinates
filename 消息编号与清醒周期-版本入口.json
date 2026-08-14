@@ -3,8 +3,8 @@
   "enabled": true,
   "name": "消息编号与清醒周期（版本入口）",
   "id": "b195f26b-4463-4521-9b88-af3b3ebcf1b4",
-  "content": "(async () => {\n  const REPO = 'juxingmaomi/awake-message-coordinates';\n  const VERSION = 'v1.0.1';\n  const URL = `https://gcore.jsdelivr.net/gh/${REPO}@${VERSION}/index.js`;\n\n  const loaderState = {\n    repo: REPO,\n    requestedTag: VERSION,\n    url: URL,\n    requestedAt: new Date().toISOString(),\n  };\n  window.__XW_AWAKE_MESSAGE_COORDINATES_LOADER__ = loaderState;\n\n  function popup(type, message) {\n    try {\n      const toastr = window.toastr || (window.parent && window.parent.toastr);\n      if (toastr && typeof toastr[type] === 'function') {\n        toastr[type](message, '消息编号与清醒周期');\n        return;\n      }\n    } catch (_) {}\n    if (type === 'error') alert(message);\n    else console.log(`[awake-message-coordinates] ${message}`);\n  }\n\n  try {\n    await import(URL);\n    const loadedVersion = window.__XW_AWAKE_MESSAGE_COORDINATES_CORE__?.version;\n    if (loadedVersion !== VERSION) {\n      throw new Error(`版本校验失败：请求 ${VERSION}，实际 ${loadedVersion || '未知'}`);\n    }\n    loaderState.loadedTag = loadedVersion;\n    loaderState.loadedAt = new Date().toISOString();\n    popup('success', `纯显示版已加载 ${loadedVersion}`);\n  } catch (error) {\n    loaderState.error = String(error && error.message || error);\n    console.error('[awake-message-coordinates] Load failed.', error);\n    popup('error', `纯显示版 ${VERSION} 加载失败。请确认 GitHub 已发布该版本。`);\n  }\n})();\n",
-  "info": "v1.0.1 版本入口。首次导入一次；以后只修改 content 里的 VERSION 并刷新页面。核心只读消息数据，不回写 mes、Roll、swipes_data 或 reasoning。",
+  "content": "(async () => {\n  const REPO = 'juxingmaomi/awake-message-coordinates';\n  const VERSION = 'v1.1.0';\n  const URL = `https://gcore.jsdelivr.net/gh/${REPO}@${VERSION}/index.js`;\n\n  const loaderState = {\n    repo: REPO,\n    requestedTag: VERSION,\n    url: URL,\n    requestedAt: new Date().toISOString(),\n  };\n  window.__XW_AWAKE_MESSAGE_COORDINATES_LOADER__ = loaderState;\n\n  function popup(type, message) {\n    try {\n      const toastr = window.toastr || (window.parent && window.parent.toastr);\n      if (toastr && typeof toastr[type] === 'function') {\n        toastr[type](message, '消息编号与清醒周期');\n        return;\n      }\n    } catch (_) {}\n    if (type === 'error') alert(message);\n    else console.log(`[awake-message-coordinates] ${message}`);\n  }\n\n  try {\n    await import(URL);\n    const loadedVersion = window.__XW_AWAKE_MESSAGE_COORDINATES_CORE__?.version;\n    if (loadedVersion !== VERSION) {\n      throw new Error(`版本校验失败：请求 ${VERSION}，实际 ${loadedVersion || '未知'}`);\n    }\n    loaderState.loadedTag = loadedVersion;\n    loaderState.loadedAt = new Date().toISOString();\n    popup('success', `纯显示版已加载 ${loadedVersion}`);\n  } catch (error) {\n    loaderState.error = String(error && error.message || error);\n    console.error('[awake-message-coordinates] Load failed.', error);\n    popup('error', `纯显示版 ${VERSION} 加载失败。请确认 GitHub 已发布该版本。`);\n  }\n})();\n",
+  "info": "v1.1.0 版本入口。首次导入一次；以后只修改 content 里的 VERSION 并刷新页面。核心只读消息数据，不回写 mes、Roll、swipes_data 或 reasoning。",
   "button": {
     "enabled": true,
     "buttons": [
@@ -14,6 +14,10 @@
       },
       {
         "name": "校正计数",
+        "visible": true
+      },
+      {
+        "name": "结束清醒",
         "visible": true
       }
     ]

@@ -1,10 +1,10 @@
 // == TavernHelper Script ==
 // name: 消息编号与清醒周期（纯显示版）
 // author: Codex
-// version: v1.0.1
+// version: v1.1.0
 // description: 只在页面显示消息楼层与清醒周期坐标，不回写消息、Roll 或 reasoning。
 
-const SCRIPT_VERSION = 'v1.0.1';
+const SCRIPT_VERSION = 'v1.1.0';
 
 const SCRIPT_LABEL = '消息编号与清醒周期';
 const STATE_KEY = 'st_awake_message_counter';
@@ -313,7 +313,7 @@ function renderMessage(messageElement, messageId, message, cycleInfo) {
     }
 
     const legacy = parseLegacyMarker(message.mes);
-    const sinceWake = cycleInfo?.ordinal ?? legacy?.sinceWake ?? null;
+    const sinceWake = cycleInfo?.ordinal ?? null;
     const marker = makeMarker(messageId, sinceWake);
     const messageTextElement = messageElement.querySelector(':scope > .mes_block > .mes_text');
     const renderedText = String(messageTextElement?.textContent ?? '');
@@ -538,9 +538,13 @@ async function refreshGenerationPrompt() {
         return;
     }
 
-    await setCoordinatePrompt(
-        makeGenerationPrompt(buildGenerationSnapshot(type, options)),
-    );
+    const snapshot = buildGenerationSnapshot(type, options);
+    if (!snapshot.currentCycleId) {
+        await clearGenerationPrompt();
+        return;
+    }
+
+    await setCoordinatePrompt(makeGenerationPrompt(snapshot));
 }
 
 async function beginGeneration(type, options = {}, dryRun = false) {
@@ -587,6 +591,26 @@ function startAwakeCycle() {
     toastr.success('新的清醒周期已开始，下一条消息从 #1 计数。', '我醒了');
 }
 
+function endAwakeCycle() {
+    const hadAwakeState = getRawAwakeState() !== null;
+    if (hadAwakeState) {
+        deleteVariable(STATE_KEY, { type: 'chat' });
+    }
+
+    scheduleRender();
+    void clearGenerationPrompt();
+
+    if (!hadAwakeState) {
+        toastr.info('当前没有进行中的清醒周期。', '结束清醒');
+        return;
+    }
+
+    toastr.success(
+        '清醒周期已清零；再次点击“我醒了”后会从 #1 重新计数。',
+        '结束清醒',
+    );
+}
+
 function inspectAwakeCounter() {
     const { state, cycleIndex } = renderAllMessages();
     if (!state?.cycle_id) {
@@ -625,7 +649,12 @@ function cleanup() {
     void clearGenerationPrompt();
 }
 
+if (typeof appendInexistentScriptButtons === 'function') {
+    appendInexistentScriptButtons([{ name: '结束清醒', visible: true }]);
+}
+
 eventOn(getButtonEvent('我醒了'), startAwakeCycle);
+eventOn(getButtonEvent('结束清醒'), endAwakeCycle);
 eventOn(getButtonEvent('校正计数'), inspectAwakeCounter);
 
 const listenLast = typeof eventMakeLast === 'function' ? eventMakeLast : eventOn;
