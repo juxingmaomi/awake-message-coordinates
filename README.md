@@ -21,7 +21,7 @@
 
 ## 首次安装
 
-1. 在 Release 中下载并导入 [消息编号与清醒周期-版本入口.json](https://github.com/juxingmaomi/awake-message-coordinates/releases/latest/download/%E6%B6%88%E6%81%AF%E7%BC%96%E5%8F%B7%E4%B8%8E%E6%B8%85%E9%86%92%E5%91%A8%E6%9C%9F-%E7%89%88%E6%9C%AC%E5%85%A5%E5%8F%A3.json)。
+1. 在 Release 中下载并导入 [awake-message-coordinates-entry.json](https://github.com/juxingmaomi/awake-message-coordinates/releases/latest/download/awake-message-coordinates-entry.json)。
 2. 保持旧的“消息编号与清醒周期（Thinking显示修复版）”关闭。
 3. 只启用“消息编号与清醒周期（版本入口）”，然后刷新 H 盘酒馆页面。
 4. “我醒了”只在真正开始新清醒周期时点击。
