@@ -31,15 +31,15 @@
 入口壳只需导入一次。新版本发布后，在 TavernHelper 的入口脚本中修改：
 
 ```js
-const VERSION = 'v1.0.0';
+const VERSION = 'v1.0.1';
 ```
 
-例如将它改成 `v1.0.1`，保存后刷新页面即可。对应版本标签必须已经在 GitHub 发布。
+例如将它改成后续发布的版本号，保存后刷新页面即可。对应版本标签必须已经在 GitHub 发布。
 
 固定版本 CDN 地址：
 
 ```text
-https://gcore.jsdelivr.net/gh/juxingmaomi/awake-message-coordinates@v1.0.0/index.js
+https://gcore.jsdelivr.net/gh/juxingmaomi/awake-message-coordinates@v1.0.1/index.js
 ```
 
 ## 验证
@@ -49,4 +49,3 @@ npm test
 ```
 
 测试覆盖普通发送、Roll、重新生成、继续生成、删除消息、系统/工具排除、v1 状态迁移、提示词清除，以及消息与 reasoning 元数据不变性。
-

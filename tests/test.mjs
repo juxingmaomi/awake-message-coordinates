@@ -337,6 +337,7 @@ function assertPromptCoordinates({ userFloor, userOrdinal, replyFloor, replyOrdi
     assert.match(content, new RegExp(`第 #${userOrdinal} 条`));
     assert.match(content, new RegExp(`第 #${replyFloor} 楼`));
     assert.match(content, new RegExp(`第 #${replyOrdinal} 条`));
+    assert.equal(content.split('\n').length, 3);
 }
 
 await flushTasks();

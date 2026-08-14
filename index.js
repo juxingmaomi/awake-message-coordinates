@@ -1,10 +1,10 @@
 // == TavernHelper Script ==
 // name: 消息编号与清醒周期（纯显示版）
 // author: Codex
-// version: v1.0.0
+// version: v1.0.1
 // description: 只在页面显示消息楼层与清醒周期坐标，不回写消息、Roll 或 reasoning。
 
-const SCRIPT_VERSION = 'v1.0.0';
+const SCRIPT_VERSION = 'v1.0.1';
 
 const SCRIPT_LABEL = '消息编号与清醒周期';
 const STATE_KEY = 'st_awake_message_counter';
@@ -494,7 +494,6 @@ function makeGenerationPrompt(snapshot) {
             ? `你本次回复：第 #${snapshot.replyMessageId} 楼。`
             : `你本次回复：第 #${snapshot.replyMessageId} 楼（本次清醒周期第 #${snapshot.replySinceWake} 条）。`,
     );
-    lines.push('楼层号以 SillyTavern 当前消息 ID 为准；重 Roll 不增加楼层，系统与工具楼层不计入清醒条数。');
     return lines.join('\n');
 }
 

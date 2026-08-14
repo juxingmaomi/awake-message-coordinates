@@ -1,6 +1,6 @@
 (async () => {
   const REPO = 'juxingmaomi/awake-message-coordinates';
-  const VERSION = 'v1.0.0';
+  const VERSION = 'v1.0.1';
   const URL = `https://gcore.jsdelivr.net/gh/${REPO}@${VERSION}/index.js`;
 
   const loaderState = {
