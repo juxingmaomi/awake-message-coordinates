@@ -1,6 +1,6 @@
 (async () => {
   const REPO = 'juxingmaomi/awake-message-coordinates';
-  const VERSION = 'v1.1.0';
+  const VERSION = 'v1.2.0';
   const URL = `https://gcore.jsdelivr.net/gh/${REPO}@${VERSION}/index.js`;
 
   const loaderState = {
@@ -31,10 +31,10 @@
     }
     loaderState.loadedTag = loadedVersion;
     loaderState.loadedAt = new Date().toISOString();
-    popup('success', `纯显示版已加载 ${loadedVersion}`);
+    popup('success', `消息锚点版已加载 ${loadedVersion}`);
   } catch (error) {
     loaderState.error = String(error && error.message || error);
     console.error('[awake-message-coordinates] Load failed.', error);
-    popup('error', `纯显示版 ${VERSION} 加载失败。请确认 GitHub 已发布该版本。`);
+    popup('error', `消息锚点版 ${VERSION} 加载失败。请确认 GitHub 已发布该版本。`);
   }
 })();

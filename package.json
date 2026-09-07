@@ -1,9 +1,10 @@
 {
   "name": "awake-message-coordinates",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node tests/test.mjs"
+    "test": "node tests/test.mjs",
+    "build:entry": "node scripts/build-entry.mjs"
   }
 }

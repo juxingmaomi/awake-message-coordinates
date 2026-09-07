@@ -1,10 +1,10 @@
 // == TavernHelper Script ==
-// name: 消息编号与清醒周期（纯显示版）
+// name: 消息编号与清醒周期（消息锚点版）
 // author: Codex
-// version: v1.1.0
-// description: 只在页面显示消息楼层与清醒周期坐标，不回写消息、Roll 或 reasoning。
+// version: v1.2.0
+// description: 从消息中的清醒标记恢复计数；仅更新正文尾标，不重绘或修改 reasoning。
 
-const SCRIPT_VERSION = 'v1.1.0';
+const SCRIPT_VERSION = 'v1.2.0';
 
 const SCRIPT_LABEL = '消息编号与清醒周期';
 const STATE_KEY = 'st_awake_message_counter';
@@ -13,8 +13,11 @@ const STYLE_ID = 'st-awake-message-coordinate-style';
 const FOOTER_CLASS = 'st-awake-message-coordinate-footer';
 const LEGACY_HIDDEN_CLASS = 'st-awake-message-coordinate-legacy-hidden';
 const SYSTEM_MESSAGE_NAME = 'SillyTavern System';
-const LEGACY_MARKER_PATTERN = /\[message_id:\s*#(\d+)(?:\s*\|\s*since_wake:\s*#(\d+))?\]/g;
-const LEGACY_MARKER_EXACT_PATTERN = /^\[message_id:\s*#\d+(?:\s*\|\s*since_wake:\s*#\d+)?\]\s*$/;
+const LEGACY_MARKER_PATTERN = /\[message_id:\s*#(\d+)(?:\s*\|\s*since_wake:\s*(?:#(\d+)|unknown))?\]/g;
+const LEGACY_MARKER_EXACT_PATTERN = /^\[message_id:\s*#\d+(?:\s*\|\s*since_wake:\s*(?:#\d+|unknown))?\]\s*$/;
+const BOUNDARY_PATTERN = /^<awake_(start|end)>(amc-v1-[a-z0-9-]+)<\/awake_\1>[ \t]*$/gm;
+const COORDINATE_PATTERN = /(?:\r?\n){0,2}<message_coordinates>\[message_id: #\d+ \| since_wake: (?:#\d+|unknown)\]<\/message_coordinates>/g;
+const NON_DIALOGUE_TYPES = new Set(['narrator', 'comment', 'status', 'system', 'tool']);
 const SAME_FLOOR_GENERATION_TYPES = new Set([
     'swipe',
     'regenerate',
@@ -27,13 +30,27 @@ let chatObserver = null;
 let renderFrame = null;
 let activeGeneration = null;
 let promptRevision = 0;
+let cycleCache = null;
+let saveQueue = Promise.resolve();
+let disposed = false;
+const textCache = new WeakMap();
+const unsavedChats = new Set();
+
+function getContext() {
+    return SillyTavern?.getContext?.() ?? SillyTavern;
+}
+
+function getChatKey(context = getContext()) {
+    return JSON.stringify([context?.groupId, context?.characterId, context?.chatId]);
+}
 
 function getParentDocument() {
     return window.parent?.document ?? document;
 }
 
 function getChat() {
-    return Array.isArray(SillyTavern?.chat) ? SillyTavern.chat : [];
+    const chat = getContext()?.chat ?? SillyTavern?.chat;
+    return Array.isArray(chat) ? chat : [];
 }
 
 function isConversationMessage(message) {
@@ -42,14 +59,14 @@ function isConversationMessage(message) {
     }
 
     if (
-        message.is_system === true ||
         message.name === SYSTEM_MESSAGE_NAME ||
-        message.extra?.type === 'narrator' ||
-        Array.isArray(message.extra?.tool_invocations)
+        NON_DIALOGUE_TYPES.has(message.extra?.type) ||
+        (message.extra?.isSmallSys === true && message.is_user !== true)
     ) {
         return false;
     }
 
+    // is_system is also the "hidden from the prompt" flag on ordinary dialogue.
     return message.is_user === true || Boolean(
         Array.isArray(message.swipes) || message.send_date,
     );
@@ -64,135 +81,211 @@ function getRawAwakeState() {
     }
 }
 
-function normalizeCycle(value) {
-    if (!value || typeof value !== 'object' || !value.cycle_id) {
-        return null;
-    }
-
-    const startMessageId = Number(value.start_message_id);
-    return {
-        cycle_id: String(value.cycle_id),
-        start_message_id: Number.isFinite(startMessageId) ? startMessageId : null,
-        started_at: value.started_at ? String(value.started_at) : null,
-        ended_at: value.ended_at ? String(value.ended_at) : null,
-    };
-}
-
 function normalizeAwakeState(value = getRawAwakeState()) {
-    if (!value || typeof value !== 'object') {
+    if (!value || value.version !== 3) {
         return null;
     }
-
-    const current = normalizeCycle(value);
-    const cycles = [];
-    const seen = new Set();
-
-    for (const candidate of Array.isArray(value.cycles) ? value.cycles : []) {
-        const cycle = normalizeCycle(candidate);
-        if (!cycle || seen.has(cycle.cycle_id)) {
-            continue;
-        }
-
-        seen.add(cycle.cycle_id);
-        cycles.push(cycle);
+    if (value.mode === 'pending' && /^(start|end)$/.test(value.kind) && /^amc-v1-[a-z0-9-]+$/.test(value.id)) {
+        return { version: 3, mode: 'pending', kind: value.kind, id: value.id };
     }
-
-    if (current && !seen.has(current.cycle_id)) {
-        cycles.push(current);
+    if (value.mode !== 'active' || !/^amc-v1-[a-z0-9-]+$/.test(value.last_boundary_id)) {
+        return null;
     }
-
-    cycles.sort((left, right) => {
-        const leftTime = Date.parse(left.started_at ?? '');
-        const rightTime = Date.parse(right.started_at ?? '');
-        if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
-            return leftTime - rightTime;
-        }
-        return Number(left.start_message_id ?? 0) - Number(right.start_message_id ?? 0);
-    });
-
-    if (!current) {
-        return cycles.length > 0
-            ? { ...cycles.at(-1), version: 2, cycles }
-            : null;
-    }
-
     return {
-        ...current,
-        version: 2,
-        cycles,
+        version: 3,
+        mode: 'active',
+        last_boundary_id: value.last_boundary_id,
     };
 }
 
 function saveAwakeState(state) {
     insertOrAssignVariables({ [STATE_KEY]: state }, { type: 'chat' });
+    cycleCache = null;
 }
 
-function getMessageCycle(message, messageId, cycles) {
-    if (!isConversationMessage(message) || cycles.length === 0) {
-        return null;
-    }
-
-    const sentAt = Date.parse(message.send_date ?? '');
-    if (Number.isFinite(sentAt)) {
-        for (let index = cycles.length - 1; index >= 0; index--) {
-            const cycle = cycles[index];
-            const startedAt = Date.parse(cycle.started_at ?? '');
-            const nextStartedAt = Date.parse(cycles[index + 1]?.started_at ?? '');
-
-            if (
-                Number.isFinite(startedAt) &&
-                sentAt >= startedAt &&
-                (!Number.isFinite(nextStartedAt) || sentAt < nextStartedAt)
-            ) {
-                return cycle;
+function readMessageTags(message) {
+    let cached = textCache.get(message);
+    if (cached?.text !== message.mes) {
+        // Ignore examples in fenced code. Only our standalone, namespaced markers count.
+        const boundaries = [];
+        let coordinateCount = 0;
+        let fence = null;
+        for (const line of message.mes.split(/\r?\n/)) {
+            const delimiter = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+            if (delimiter) {
+                const token = delimiter[1];
+                if (!fence) fence = token;
+                else if (token[0] === fence[0] && token.length >= fence.length) fence = null;
+                continue;
             }
+            if (fence) continue;
+            coordinateCount += Array.from(line.matchAll(COORDINATE_PATTERN)).length;
+            const match = Array.from(line.matchAll(BOUNDARY_PATTERN)).at(-1);
+            if (match) boundaries.push({ kind: match[1], id: match[2] });
         }
+        cached = {
+            text: message.mes,
+            boundaries,
+            coordinateCount,
+            hasCoordinates: coordinateCount > 0,
+        };
+        textCache.set(message, cached);
     }
-
-    for (let index = cycles.length - 1; index >= 0; index--) {
-        const cycle = cycles[index];
-        const startMessageId = Number(cycle.start_message_id);
-        const nextStartMessageId = Number(cycles[index + 1]?.start_message_id);
-
-        if (
-            Number.isFinite(startMessageId) &&
-            messageId >= startMessageId &&
-            (!Number.isFinite(nextStartMessageId) || messageId < nextStartMessageId)
-        ) {
-            return cycle;
-        }
-    }
-
-    return null;
+    return cached;
 }
 
 function buildCycleIndex(chat = getChat(), state = normalizeAwakeState()) {
-    const cycles = state?.cycles ?? [];
     const byMessageId = new Map();
     const countsByCycle = new Map();
+    const boundaryIds = new Set();
+    let currentCycleId = null;
+    let lastBoundaryId = null;
+    let startMessageId = null;
 
     for (let messageId = 0; messageId < chat.length; messageId++) {
         const message = chat[messageId];
-        const cycle = getMessageCycle(message, messageId, cycles);
-        if (!cycle) {
-            continue;
+        if (!isConversationMessage(message)) continue;
+        if (message.is_user === true) {
+            for (const boundary of readMessageTags(message).boundaries) {
+                if (boundaryIds.has(boundary.id)) continue;
+                boundaryIds.add(boundary.id);
+                lastBoundaryId = boundary.id;
+                currentCycleId = boundary.kind === 'start' ? boundary.id : null;
+                startMessageId = currentCycleId ? messageId : null;
+            }
         }
-
-        const ordinal = (countsByCycle.get(cycle.cycle_id) ?? 0) + 1;
-        countsByCycle.set(cycle.cycle_id, ordinal);
+        if (!currentCycleId) continue;
+        const ordinal = (countsByCycle.get(currentCycleId) ?? 0) + 1;
+        countsByCycle.set(currentCycleId, ordinal);
         byMessageId.set(messageId, {
-            cycleId: cycle.cycle_id,
+            cycleId: currentCycleId,
             ordinal,
         });
     }
-
+    const detectedCycleId = currentCycleId;
+    const pending = state?.mode === 'pending' && !boundaryIds.has(state.id) ? state : null;
+    const missingAnchor = state?.mode === 'active' && !boundaryIds.has(state.last_boundary_id);
+    if (pending || missingAnchor) currentCycleId = null;
     return {
         byMessageId,
         countsByCycle,
-        currentCount: state?.cycle_id
-            ? countsByCycle.get(state.cycle_id) ?? 0
-            : 0,
+        boundaryIds,
+        lastBoundaryId,
+        currentCycleId,
+        detectedCycleId,
+        startMessageId,
+        pending,
+        missingAnchor,
+        currentCount: currentCycleId ? countsByCycle.get(currentCycleId) ?? 0 : 0,
     };
+}
+
+function getCycleIndex() {
+    const chat = getChat();
+    const state = normalizeAwakeState();
+    const key = `${getChatKey()}:${JSON.stringify(state)}`;
+    if (!cycleCache || cycleCache.chat !== chat || cycleCache.length !== chat.length || cycleCache.key !== key) {
+        cycleCache = { chat, length: chat.length, key, index: buildCycleIndex(chat, state) };
+    }
+    return cycleCache.index;
+}
+
+function stripCoordinateTags(text) {
+    let result = '';
+    let plain = '';
+    let fence = null;
+    for (const line of text.split(/(?<=\n)/)) {
+        const delimiter = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+        if (!fence && !delimiter) {
+            plain += line;
+            continue;
+        }
+        result += plain.replace(COORDINATE_PATTERN, '');
+        plain = '';
+        result += line;
+        if (delimiter) {
+            const token = delimiter[1];
+            if (!fence) fence = token;
+            else if (token[0] === fence[0] && token.length >= fence.length) fence = null;
+        }
+    }
+    return result + plain.replace(COORDINATE_PATTERN, '');
+}
+
+function makeCoordinateTag(messageId, sinceWake) {
+    return `<message_coordinates>${makeMarker(messageId, sinceWake)}</message_coordinates>`;
+}
+
+function writeMessageText(message, text) {
+    if (message.mes === text) return false;
+    const previous = message.mes;
+    const swipeId = message.swipe_id ?? 0;
+    message.mes = text;
+    // Update only the selected branch's text, never replace branch or reasoning metadata.
+    if (Array.isArray(message.swipes) && message.swipes[swipeId] === previous) {
+        message.swipes[swipeId] = text;
+    }
+    textCache.delete(message);
+    return true;
+}
+
+async function synchronizeMessages({ messageId = null, capturePending = false, repair = false } = {}) {
+    if (disposed) return;
+    const context = getContext();
+    const key = getChatKey(context);
+    const chat = getChat();
+    if (typeof context?.saveChat !== 'function') {
+        throw new Error('当前酒馆未提供保存聊天接口；没有修改消息。');
+    }
+    cycleCache = null;
+    let index = getCycleIndex();
+    const pending = index.pending;
+    let changed = false;
+    const sentMessage = chat[messageId];
+    if (capturePending && pending && sentMessage?.is_user === true && isConversationMessage(sentMessage)) {
+        const boundary = `<awake_${pending.kind}>${pending.id}</awake_${pending.kind}>`;
+        changed = writeMessageText(sentMessage, `${stripCoordinateTags(sentMessage.mes)}\n\n${boundary}`);
+        cycleCache = null;
+        index = getCycleIndex();
+    }
+    for (let id = 0; id < chat.length; id++) {
+        const message = chat[id];
+        if (!isConversationMessage(message)) continue;
+        const info = index.byMessageId.get(id);
+        const tags = readMessageTags(message);
+        const eligible = id === messageId || tags.hasCoordinates || (
+            repair && (message.is_system !== true || info?.cycleId === index.currentCycleId)
+        );
+        if (!eligible) continue;
+        const uncertain = index.missingAnchor && info?.cycleId === index.detectedCycleId;
+        const ordinal = uncertain ? null : info?.ordinal ?? null;
+        const suffix = `\n\n${makeCoordinateTag(id, ordinal)}`;
+        if (tags.coordinateCount === 1 && message.mes.endsWith(suffix)) continue;
+        const body = stripCoordinateTags(message.mes);
+        if (message.is_user !== true && !body.trim()) continue;
+        const text = `${body}${suffix}`;
+        changed = writeMessageText(message, text) || changed;
+    }
+    if (changed) {
+        unsavedChats.add(key);
+        cycleCache = null;
+    }
+    scheduleRender();
+    if (!unsavedChats.has(key)) return;
+    // Serialize saves and re-check chat identity before touching chat-scoped state after an await.
+    const save = saveQueue.then(async () => {
+        if (disposed || getChatKey() !== key || getChat() !== chat) return;
+        await context.saveChat();
+        if (disposed || getChatKey() !== key || getChat() !== chat) return;
+        unsavedChats.delete(key);
+        const state = normalizeAwakeState();
+        const latest = getCycleIndex();
+        if (state?.mode === 'pending' && latest.boundaryIds.has(state.id)) {
+            saveAwakeState({ version: 3, mode: 'active', last_boundary_id: state.id });
+        }
+    });
+    saveQueue = save.catch(() => {});
+    return save;
 }
 
 function parseLegacyMarker(text) {
@@ -210,9 +303,7 @@ function parseLegacyMarker(text) {
 }
 
 function makeMarker(messageId, sinceWake = null) {
-    return sinceWake === null
-        ? `[message_id: #${messageId}]`
-        : `[message_id: #${messageId} | since_wake: #${sinceWake}]`;
+    return `[message_id: #${messageId} | since_wake: ${sinceWake === null ? 'unknown' : `#${sinceWake}`}]`;
 }
 
 function installStyle() {
@@ -277,6 +368,7 @@ function findStandaloneLegacyMarkers(messageTextElement) {
     return Array.from(messageTextElement.querySelectorAll('p, div, span'))
         .filter(element => (
             !element.closest(`.${FOOTER_CLASS}`) &&
+            !element.closest('pre, code') &&
             LEGACY_MARKER_EXACT_PATTERN.test(String(element.textContent ?? '').trim())
         ));
 }
@@ -316,6 +408,14 @@ function renderMessage(messageElement, messageId, message, cycleInfo) {
     const sinceWake = cycleInfo?.ordinal ?? null;
     const marker = makeMarker(messageId, sinceWake);
     const messageTextElement = messageElement.querySelector(':scope > .mes_block > .mes_text');
+    if (message.is_user === true) {
+        const ids = new Set(readMessageTags(message).boundaries.map(boundary => boundary.id));
+        for (const element of messageTextElement?.querySelectorAll('p, div, span, awake_start, awake_end') ?? []) {
+            if (!element.closest('pre, code') && ids.has(String(element.textContent ?? '').trim())) {
+                element.classList.add(LEGACY_HIDDEN_CLASS);
+            }
+        }
+    }
     const renderedText = String(messageTextElement?.textContent ?? '');
     const renderedHasLegacy = Boolean(legacy && renderedText.includes(legacy.raw));
     const standaloneLegacyMarkers = legacy
@@ -355,7 +455,7 @@ function renderAllMessages() {
     const parentDocument = getParentDocument();
     const chat = getChat();
     const state = normalizeAwakeState();
-    const cycleIndex = buildCycleIndex(chat, state);
+    const cycleIndex = getCycleIndex();
 
     for (const messageElement of parentDocument.querySelectorAll('#chat > .mes[mesid]')) {
         const messageId = Number(messageElement.getAttribute('mesid'));
@@ -368,7 +468,7 @@ function renderAllMessages() {
             messageElement,
             messageId,
             chat[messageId],
-            cycleIndex.byMessageId.get(messageId) ?? null,
+            cycleIndex.missingAnchor ? null : cycleIndex.byMessageId.get(messageId) ?? null,
         );
     }
 
@@ -426,8 +526,7 @@ function hasPendingUserText(type, options = {}) {
 
 function buildGenerationSnapshot(type, options = {}) {
     const chat = getChat();
-    const state = normalizeAwakeState();
-    const cycleIndex = buildCycleIndex(chat, state);
+    const cycleIndex = getCycleIndex();
     const pendingUser = hasPendingUserText(type, options);
     const lastConversationId = findLastConversationId(chat);
     const lastAssistantId = findLastConversationId(chat, message => message.is_user !== true);
@@ -449,7 +548,8 @@ function buildGenerationSnapshot(type, options = {}) {
         replyMessageId = chat.length;
     }
 
-    const currentCycleId = state?.cycle_id ?? null;
+    const startsWithPendingUser = pendingUser && cycleIndex.pending?.kind === 'start';
+    const currentCycleId = startsWithPendingUser ? cycleIndex.pending.id : cycleIndex.currentCycleId;
     const currentCount = cycleIndex.currentCount;
     const currentOrdinal = messageId => {
         const info = cycleIndex.byMessageId.get(messageId);
@@ -506,7 +606,7 @@ function shouldInjectForGeneration(type, options, dryRun) {
 }
 
 async function setCoordinatePrompt(content) {
-    const context = SillyTavern?.getContext?.();
+    const context = getContext();
     if (typeof context?.setExtensionPrompt !== 'function') {
         console.warn(`[${SCRIPT_LABEL}] 当前酒馆未提供提示词注入接口。`);
         return;
@@ -539,16 +639,14 @@ async function refreshGenerationPrompt() {
     }
 
     const snapshot = buildGenerationSnapshot(type, options);
-    if (!snapshot.currentCycleId) {
-        await clearGenerationPrompt();
-        return;
-    }
-
     await setCoordinatePrompt(makeGenerationPrompt(snapshot));
 }
 
 async function beginGeneration(type, options = {}, dryRun = false) {
-    activeGeneration = { type, options, dryRun };
+    activeGeneration = { type, options, dryRun, chatKey: getChatKey() };
+    if (shouldInjectForGeneration(type, options, dryRun)) {
+        await synchronizeMessages({ repair: true });
+    }
     await refreshGenerationPrompt();
 }
 
@@ -557,81 +655,93 @@ async function clearGenerationPrompt() {
     await setCoordinatePrompt('');
 }
 
-function startAwakeCycle() {
-    const chat = getChat();
-    const previousState = normalizeAwakeState();
-    const previousIndex = buildCycleIndex(chat, previousState);
-
-    if (previousState?.cycle_id && previousIndex.currentCount === 0) {
-        toastr.info('还没有新消息，本次重复点击已忽略。', '我醒了');
+function armBoundary(kind) {
+    const context = getContext();
+    if (!context?.chatId) {
+        toastr.warning('请先打开一个聊天。', SCRIPT_LABEL);
         return;
     }
-
-    const now = new Date().toISOString();
-    const cycles = (previousState?.cycles ?? []).map(cycle => (
-        cycle.cycle_id === previousState?.cycle_id && !cycle.ended_at
-            ? { ...cycle, ended_at: now }
-            : cycle
-    ));
-    const cycle = {
-        cycle_id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        start_message_id: chat.length,
-        started_at: now,
-        ended_at: null,
-    };
-    cycles.push(cycle);
-
-    saveAwakeState({
-        ...cycle,
-        version: 2,
-        cycles,
-    });
-    scheduleRender();
-    void refreshGenerationPrompt();
-    toastr.success('新的清醒周期已开始，下一条消息从 #1 计数。', '我醒了');
-}
-
-function endAwakeCycle() {
-    const hadAwakeState = getRawAwakeState() !== null;
-    if (hadAwakeState) {
-        deleteVariable(STATE_KEY, { type: 'chat' });
-    }
-
-    scheduleRender();
-    void clearGenerationPrompt();
-
-    if (!hadAwakeState) {
-        toastr.info('当前没有进行中的清醒周期。', '结束清醒');
+    const streaming = context.streamingProcessor;
+    if ((streaming && !streaming.isFinished && !streaming.isStopped) || activeGeneration) {
+        toastr.warning('请等本次回复结束后再设置起点。', SCRIPT_LABEL);
         return;
     }
-
+    const state = normalizeAwakeState();
+    const index = getCycleIndex();
+    if (state?.mode === 'pending' && state.kind === kind && !index.boundaryIds.has(state.id)) {
+        toastr.info('已经准备好，等待下一条你发送的消息。', SCRIPT_LABEL);
+        return;
+    }
+    const id = `amc-v1-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    saveAwakeState({ version: 3, mode: 'pending', kind, id });
+    scheduleRender();
     toastr.success(
-        '清醒周期已清零；再次点击“我醒了”后会从 #1 重新计数。',
-        '结束清醒',
+        kind === 'start'
+            ? '下一条你发送的消息将保存清醒起点，并从 #1 开始计数。'
+            : '下一条你发送的消息将保存结束标记；以后仍保留总编号。',
+        SCRIPT_LABEL,
     );
 }
 
-function inspectAwakeCounter() {
-    const { state, cycleIndex } = renderAllMessages();
-    if (!state?.cycle_id) {
-        toastr.warning('当前聊天还没有清醒周期，请先点“我醒了”。', '校正计数');
+function startAwakeCycle() {
+    armBoundary('start');
+}
+
+function endAwakeCycle() {
+    armBoundary('end');
+}
+
+async function inspectAwakeCounter() {
+    await synchronizeMessages({ repair: true });
+    const { cycleIndex } = renderAllMessages();
+    if (cycleIndex.missingAnchor) {
+        toastr.warning('保存的起点标记已不在聊天里，未猜测新的起点。请恢复该消息，或点“我醒了”开始新周期。', '校正计数');
         return;
     }
-
+    if (!cycleIndex.currentCycleId) {
+        toastr.info(cycleIndex.pending ? '已校正总编号；等待下一条你发送的消息保存标记。' : '已校正总编号；没有找到进行中的清醒起点。', '校正计数');
+        return;
+    }
     toastr.info(
-        `已按当前聊天重新计算；当前清醒周期共 #${cycleIndex.currentCount} 条。`,
+        `已从第 #${cycleIndex.startMessageId} 楼的清醒标记恢复；当前共 #${cycleIndex.currentCount} 条（包含隐藏的普通对话）。`,
         '校正计数',
     );
 }
 
-function handleMessageChange() {
+async function handleMessageChange(messageId, capturePending = false) {
+    cycleCache = null;
+    await synchronizeMessages({ messageId: Number.isInteger(messageId) ? messageId : null, capturePending });
     scheduleRender();
     if (activeGeneration) {
         return refreshGenerationPrompt();
     }
 }
 
+async function finishGeneration() {
+    const generation = activeGeneration;
+    try {
+        if (generation?.chatKey === getChatKey() && shouldInjectForGeneration(generation.type, generation.options, generation.dryRun)) {
+            await synchronizeMessages({ messageId: getChat().length - 1 });
+        }
+    } finally {
+        if (activeGeneration === generation) await clearGenerationPrompt();
+    }
+}
+
+function safely(handler) {
+    return async (...args) => {
+        try {
+            await handler(...args);
+        } catch (error) {
+            console.error(`[${SCRIPT_LABEL}]`, error);
+            toastr.error?.('编号处理或保存失败；未重置清醒起点。请用“校正计数”重试。', SCRIPT_LABEL);
+            await clearGenerationPrompt();
+        }
+    };
+}
+
 function cleanup() {
+    disposed = true;
     chatObserver?.disconnect();
     chatObserver = null;
 
@@ -653,33 +763,40 @@ if (typeof appendInexistentScriptButtons === 'function') {
     appendInexistentScriptButtons([{ name: '结束清醒', visible: true }]);
 }
 
-eventOn(getButtonEvent('我醒了'), startAwakeCycle);
-eventOn(getButtonEvent('结束清醒'), endAwakeCycle);
-eventOn(getButtonEvent('校正计数'), inspectAwakeCounter);
+eventOn(getButtonEvent('我醒了'), safely(startAwakeCycle));
+eventOn(getButtonEvent('结束清醒'), safely(endAwakeCycle));
+eventOn(getButtonEvent('校正计数'), safely(inspectAwakeCounter));
 
 const listenLast = typeof eventMakeLast === 'function' ? eventMakeLast : eventOn;
-listenLast(tavern_events.GENERATION_AFTER_COMMANDS, beginGeneration);
-listenLast(tavern_events.MESSAGE_SENT, handleMessageChange);
-listenLast(tavern_events.MESSAGE_RECEIVED, handleMessageChange);
-listenLast(tavern_events.MESSAGE_SWIPED, handleMessageChange);
+listenLast(tavern_events.GENERATION_AFTER_COMMANDS, safely(beginGeneration));
+listenLast(tavern_events.MESSAGE_SENT, safely(messageId => handleMessageChange(messageId, true)));
+listenLast(tavern_events.MESSAGE_RECEIVED, safely(messageId => handleMessageChange(messageId)));
+listenLast(tavern_events.MESSAGE_SWIPED, safely(messageId => handleMessageChange(messageId)));
 listenLast(tavern_events.USER_MESSAGE_RENDERED, scheduleRender);
 listenLast(tavern_events.CHARACTER_MESSAGE_RENDERED, scheduleRender);
 
 if (tavern_events.MESSAGE_SWIPE_DELETED) {
-    listenLast(tavern_events.MESSAGE_SWIPE_DELETED, handleMessageChange);
+    listenLast(tavern_events.MESSAGE_SWIPE_DELETED, safely(messageId => handleMessageChange(messageId)));
 }
 
 if (tavern_events.MORE_MESSAGES_LOADED) {
     listenLast(tavern_events.MORE_MESSAGES_LOADED, scheduleRender);
 }
 
-eventOn(tavern_events.MESSAGE_DELETED, handleMessageChange);
+eventOn(tavern_events.MESSAGE_DELETED, safely(() => handleMessageChange()));
+for (const event of [tavern_events.MESSAGE_EDITED, tavern_events.MESSAGE_UPDATED]) {
+    if (event) listenLast(event, safely(messageId => handleMessageChange(messageId)));
+}
+for (const event of [tavern_events.TOOL_CALLS_PERFORMED, tavern_events.TOOL_CALLS_RENDERED]) {
+    if (event) listenLast(event, safely(() => handleMessageChange()));
+}
 eventOn(tavern_events.CHAT_CHANGED, () => {
+    cycleCache = null;
     void clearGenerationPrompt();
     scheduleRender();
 });
-eventOn(tavern_events.GENERATION_ENDED, clearGenerationPrompt);
-eventOn(tavern_events.GENERATION_STOPPED, clearGenerationPrompt);
+eventOn(tavern_events.GENERATION_ENDED, safely(finishGeneration));
+eventOn(tavern_events.GENERATION_STOPPED, safely(finishGeneration));
 
 $(window).on('pagehide', cleanup);
 

@@ -1,52 +1,72 @@
-# 消息编号与清醒周期（纯显示版）
+# 消息编号与清醒周期（消息锚点版）
 
-适用于 SillyTavern + TavernHelper 的消息坐标脚本。已针对 SillyTavern 1.16.0 与 TavernHelper 4.9.1 验证。
+SillyTavern + TavernHelper 脚本。v1.2.0 是消息锚点版的测试发布，尚未部署到真实聊天。
+已核对 H 盘安装的 SillyTavern 1.16.0 / TavernHelper 4.9.5 接口，并使用合成消息及浏览器夹具测试。
 
-## 功能
+## 使用方式
 
-- 在页面消息块底部显示真实的 `message_id`。
-- 点击“我醒了”后，以用户和助手的对话消息计算 `since_wake`。
-- 点击“结束清醒”会清零当前周期，并停止向模型提示词注入坐标；下次“我醒了”从 `#1` 重计。
-- 重 Roll 与继续生成共用原楼层；删除消息后按当前聊天动态重算。
-- 系统、narrator 与工具消息保留真实楼层位置，但不占用清醒条数。
-- 生成前临时向提示词注入小薇最近一条消息、本次回复楼层与清醒序号。
-- 兼容旧版已经写进正文的 `[message_id: ...]` 尾标，尽量只在 DOM 层隐藏旧尾标。
+醒来后按一次“我醒了”，然后正常发言。不需要在睡前操作，也不按零点切换周期。
+下一条用户消息会在已有的 `<time>`、`<idle>` 后保存起点和编号，例如：
 
-## 数据安全
+```xml
+<awake_start>amc-v1-example</awake_start>
 
-- 不调用 `setChatMessages` 或 `updateMessageBlock`。
-- 不修改 `mes`、`swipes`、`swipes_data`、`reasoning` 或 Roll 元数据。
-- 页面尾标是 `.mes_block` 下独立的 DOM 兄弟节点，不会重绘 `.mes_reasoning_details` 或 `.mes_text`。
-- 只有点击“我醒了”时会保存聊天级变量 `st_awake_message_counter`；点击“结束清醒”会删除它。
-- 生成结束或停止后会清空临时提示词注入。
-
-## 首次安装
-
-1. 在 Release 中下载并导入 [awake-message-coordinates-entry.json](https://github.com/juxingmaomi/awake-message-coordinates/releases/latest/download/awake-message-coordinates-entry.json)。
-2. 保持旧的“消息编号与清醒周期（Thinking显示修复版）”关闭。
-3. 只启用“消息编号与清醒周期（版本入口）”，然后刷新 H 盘酒馆页面。
-4. “我醒了”只在真正开始新清醒周期时点击。
-
-## 更新
-
-入口壳只需导入一次。新版本发布后，在 TavernHelper 的入口脚本中修改：
-
-```js
-const VERSION = 'v1.1.0';
+<message_coordinates>[message_id: #10427 | since_wake: #1]</message_coordinates>
 ```
 
-例如将它改成后续发布的版本号，保存后刷新页面即可。对应版本标签必须已经在 GitHub 发布。
+之后用户和助手的消息都在文末保存 `<message_coordinates>`。这些是实际正文，因此编辑消息时可见，
+也会随没有被隐藏的消息进入模型上下文。即将生成的回复编号仍有单独的临时提示，生成结束后清除。
+`message_id` 沿用酒馆从 0 开始的真实楼层；`since_wake` 从 1 开始，每条用户/助手消息各计一次。
+没有确认起点时使用 `since_wake: unknown`，总编号仍正常提供。
 
-固定版本 CDN 地址：
+## 恢复与计数
 
-```text
-https://gcore.jsdelivr.net/gh/juxingmaomi/awake-message-coordinates@v1.1.0/index.js
-```
+- 起点从完整聊天中的 `<awake_start>` 恢复，不依赖当前发送给模型的 80 条窗口。
+- 普通对话被总结后隐藏，仍计入清醒条数；系统、旁白、评论、状态及工具专用楼层不计入。
+- Roll、继续生成仍属于原楼层，不额外计数；实际删除消息后，按剩余记录重算。
+- 刷新或聊天级计数状态丢失，不会丢掉仍保存在消息里的起点。“校正计数”重新扫描并修复尾标。
+- 只有用户消息里的独立、带脚本命名空间的标记生效；代码块示例和助手复述不建立新周期。
+- 若已知的起点被真正删除，提示缺失而不猜测。若消息和起点都被删除或覆盖，不能凭空恢复。
+- 可选的“结束清醒”在下一条用户消息保存 `<awake_end>`。历史周期不会被清空，不需要日常使用此按钮。
+- v1/v2 旧变量没有可靠的正文锚点，不会按旧时间信息自动回填；下次“我醒了”建立新起点。
 
-## 验证
+新消息、编辑和删除时校正；没有逐 token 检查。缓存已解析的消息标记，并跳过已经正确的正文。
+普通生成前会补齐当前可发送的对话和当前清醒周期；未涉及的旧隐藏消息不会被批量加上新标签。
+
+## 写入边界
+
+- v1.2.0 会写入正文尾标，不再是 v1.1.0 的纯显示版。
+- 唯一消息写入点只改 `mes`，以及仍与原正文一致的当前 `swipes[swipe_id]` 字符串。
+- 不替换 `extra`、reasoning、签名、其他 Roll 正文、Roll 元数据或变量数组。
+- 不调用全量消息更新/重绘接口；保存使用酒馆公开的 `saveChat`。
+- 页面编号仍是独立 DOM 节点，不重绘 `.mes_text` 或 `.mes_reasoning_details`。
+- 不改时间/间隔正则，不重算已有时间。插入发生在酒馆原生正则处理之后。
+- 保存失败会提示，并保留重试所需状态；“校正计数”可重试。
+
+## 本地测试
 
 ```powershell
 npm test
+npm run build:entry -- <输出目录>
 ```
 
-测试覆盖普通发送、Roll、重新生成、继续生成、删除消息、系统/工具排除、v1 状态迁移、提示词清除，以及消息与 reasoning 元数据不变性。
+输出 `awake-message-coordinates-v1.2.0-local.json`，内含完整代码，不需要 CDN。
+测试入口默认关闭。先备份测试聊天，停用旧“消息编号与清醒周期”脚本，再启用这一份；同类版本只能启用一个。
+不要直接把它首次用在唯一的真实聊天记录上。浏览器夹具验证不等同于所有第三方插件的线上兼容性验证。
+
+## GitHub 更新
+
+在 [v1.2.0 测试发布](https://github.com/juxingmaomi/awake-message-coordinates/releases/tag/v1.2.0) 中：
+
+- `awake-message-coordinates-entry.json` 是固定版本 CDN 入口。
+- `awake-message-coordinates-v1.2.0-local.json` 是自包含测试入口，默认关闭，不依赖 CDN。
+
+已经安装“版本入口”的用户无需重复导入；备份聊天后，把入口中的版本改为：
+
+```js
+const VERSION = 'v1.2.0';
+```
+
+保存后刷新页面即可加载该版本。不要同时启用 CDN 入口和自包含入口。
+旧版本变量不会自动转换为正文锚点，请在下一次真正醒来时按“我醒了”建立起点。
+这次发布不代表已完成真实聊天中的全部第三方插件兼容性验证，建议先在聊天副本中试用。

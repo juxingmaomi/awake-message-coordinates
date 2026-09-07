@@ -1,621 +1,443 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import test from 'node:test';
 
-const sourcePath = fileURLToPath(new URL('../index.js', import.meta.url));
-const source = fs.readFileSync(sourcePath, 'utf8');
+const source = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+const clone = value => structuredClone(value);
+const STATE = 'st_awake_message_counter';
 
-for (const forbidden of [
-    'setChatMessages',
-    'updateMessageBlock',
-    'swipes_data',
-]) {
-    assert.equal(source.includes(forbidden), false, `forbidden message writer found: ${forbidden}`);
-}
-
-assert.doesNotMatch(source, /\.(?:mes|swipes|reasoning)\s*=/, 'chat or reasoning assignment found');
-assert.equal(
-    source.match(/insertOrAssignVariables\s*\(/g)?.length,
-    1,
-    'chat variables must have exactly one write site',
-);
-
-function createDomNode(tagName = 'div') {
+function node(tagName = 'div') {
     const classes = new Set();
-    const node = {
-        tagName: String(tagName).toUpperCase(),
-        id: '',
-        textContent: '',
-        attributes: {},
-        parentNode: null,
+    const value = {
+        tagName: tagName.toUpperCase(), id: '', children: [], textContent: '', parentNode: null,
         classList: {
-            add(...names) {
-                names.forEach(name => classes.add(name));
-            },
-            remove(...names) {
-                names.forEach(name => classes.delete(name));
-            },
-            contains(name) {
-                return classes.has(name);
-            },
+            add: (...names) => names.forEach(name => classes.add(name)),
+            remove: (...names) => names.forEach(name => classes.delete(name)),
+            contains: name => classes.has(name),
         },
-        setAttribute(name, value) {
-            this.attributes[name] = String(value);
-        },
-        querySelector() {
-            return null;
-        },
-        querySelectorAll() {
-            return [];
-        },
-        closest() {
-            return null;
-        },
+        setAttribute() {}, closest: () => null, querySelector: () => null, querySelectorAll: () => [],
+        appendChild(child) { child.parentNode = this; this.children.push(child); },
         remove() {
-            if (!Array.isArray(this.parentNode?.children)) {
-                return;
-            }
-            const index = this.parentNode.children.indexOf(this);
-            if (index >= 0) {
-                this.parentNode.children.splice(index, 1);
-            }
-            this.parentNode = null;
+            if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this);
         },
     };
-
-    Object.defineProperty(node, 'className', {
-        get() {
-            return Array.from(classes).join(' ');
-        },
-        set(value) {
-            classes.clear();
-            String(value).split(/\s+/).filter(Boolean).forEach(name => classes.add(name));
-        },
+    Object.defineProperty(value, 'className', {
+        get: () => [...classes].join(' '),
+        set: text => { classes.clear(); text.split(/\s+/).forEach(name => classes.add(name)); },
     });
-
-    return node;
+    return value;
 }
 
-const head = { children: [] };
-head.appendChild = node => {
-    node.parentNode = head;
-    head.children.push(node);
-};
-
-const textarea = { value: '' };
-const chatElement = {};
-const documentMock = {
-    head,
-    createElement: createDomNode,
-    getElementById(id) {
-        return head.children.find(node => node.id === id) ?? null;
-    },
-    querySelector(selector) {
-        if (selector === '#chat') {
-            return chatElement;
-        }
-        if (selector === '#send_textarea') {
-            return textarea;
-        }
-        return null;
-    },
-    querySelectorAll() {
-        return [];
-    },
-};
-
-let nextFrameId = 0;
-const cancelledFrames = new Set();
-const windowMock = {
-    parent: { document: documentMock },
-    requestAnimationFrame(callback) {
-        const id = ++nextFrameId;
-        Promise.resolve().then(() => {
-            if (!cancelledFrames.has(id)) {
-                callback();
-            }
-        });
-        return id;
-    },
-    cancelAnimationFrame(id) {
-        cancelledFrames.add(id);
-    },
-};
-
-const EVENT = {
-    GENERATION_AFTER_COMMANDS: 'generation_after_commands',
-    MESSAGE_SENT: 'message_sent',
-    MESSAGE_RECEIVED: 'message_received',
-    MESSAGE_SWIPED: 'message_swiped',
-    USER_MESSAGE_RENDERED: 'user_message_rendered',
-    CHARACTER_MESSAGE_RENDERED: 'character_message_rendered',
-    MESSAGE_SWIPE_DELETED: 'message_swipe_deleted',
-    MORE_MESSAGES_LOADED: 'more_messages_loaded',
-    MESSAGE_DELETED: 'message_deleted',
-    CHAT_CHANGED: 'chat_changed',
-    GENERATION_ENDED: 'generation_ended',
-    GENERATION_STOPPED: 'generation_stopped',
-};
-
-const handlers = new Map();
-const promptCalls = [];
-const variableWrites = [];
-const variableDeletes = [];
-const toastLog = [];
-const scriptButtons = [
-    { name: '我醒了', visible: true },
-    { name: '校正计数', visible: true },
-];
-const oldCycle = {
-    cycle_id: 'legacy-cycle',
-    start_message_id: 2,
-    started_at: '2026-08-10T10:00:00.000Z',
-};
-let chatVariables = {
-    st_awake_message_counter: structuredClone(oldCycle),
-};
-
-const chat = [
-    {
-        name: 'user',
-        is_user: true,
-        is_system: false,
-        mes: 'before cycle',
-        send_date: '2026-08-10T09:58:00.000Z',
-    },
-    {
-        name: 'assistant',
-        is_user: false,
-        is_system: false,
-        mes: 'before cycle reply',
-        send_date: '2026-08-10T09:59:00.000Z',
-        swipe_id: 0,
-        swipes: ['before cycle reply'],
-        extra: { reasoning: 'reasoning-before-cycle' },
-    },
-    {
-        name: 'Status Row',
-        is_user: false,
-        is_system: true,
-        mes: 'system status',
-        send_date: '2026-08-10T10:00:10.000Z',
-        extra: { type: 'status' },
-    },
-    {
-        name: 'user',
-        is_user: true,
-        is_system: false,
-        mes: 'first awake user message',
-        send_date: '2026-08-10T10:01:00.000Z',
-    },
-    {
-        name: 'assistant',
-        is_user: false,
-        is_system: false,
-        mes: 'first awake reply',
-        send_date: '2026-08-10T10:02:00.000Z',
-        swipe_id: 0,
-        swipes: ['first awake reply', 'unused roll'],
-        variables: [{ branch: 'a' }, { branch: 'b' }],
-        extra: {
-            reasoning: '<thinking>first awake reasoning</thinking>',
-            reasoning_duration: 12,
-            reasoning_signature: 'sig-a',
+function harness({ chat = [], variables = {}, saveHook = null } = {}) {
+    const handlers = new Map();
+    const frames = new Map();
+    const prompts = [];
+    const saves = [];
+    const toasts = [];
+    const head = node('head');
+    const textarea = { value: '' };
+    const document = {
+        head, createElement: node,
+        getElementById: id => head.children.find(child => child.id === id),
+        querySelector: selector => selector === '#send_textarea' ? textarea : {},
+        querySelectorAll: () => [],
+    };
+    const events = Object.fromEntries([
+        'GENERATION_AFTER_COMMANDS', 'MESSAGE_SENT', 'MESSAGE_RECEIVED', 'MESSAGE_SWIPED',
+        'USER_MESSAGE_RENDERED', 'CHARACTER_MESSAGE_RENDERED', 'MESSAGE_SWIPE_DELETED',
+        'MORE_MESSAGES_LOADED', 'MESSAGE_DELETED', 'CHAT_CHANGED', 'GENERATION_ENDED',
+        'GENERATION_STOPPED', 'MESSAGE_EDITED', 'MESSAGE_UPDATED',
+        'TOOL_CALLS_PERFORMED', 'TOOL_CALLS_RENDERED',
+    ].map(name => [name, name]));
+    let currentVariables = clone(variables);
+    let frame = 0;
+    const live = {
+        chat, chatId: 'chat-a', characterId: 0, groupId: null,
+        setExtensionPrompt: (...args) => prompts.push(clone(args)),
+        async saveChat() {
+            const snapshot = { chatId: live.chatId, chat: clone(live.chat), variables: clone(currentVariables) };
+            if (saveHook) await saveHook();
+            saves.push(snapshot);
         },
-    },
-    {
-        name: 'Narrator',
-        is_user: false,
-        is_system: false,
-        mes: 'narrator row',
-        send_date: '2026-08-10T10:02:30.000Z',
-        extra: { type: 'narrator' },
-    },
-    {
-        name: 'Tool',
-        is_user: false,
-        is_system: true,
-        mes: 'tool result',
-        send_date: '2026-08-10T10:03:00.000Z',
-        extra: {
-            tool_invocations: [{ id: 'tool-1', name: 'clock', result: '10:03' }],
+    };
+    const window = {
+        parent: { document },
+        requestAnimationFrame: callback => { frames.set(++frame, callback); return frame; },
+        cancelAnimationFrame: id => frames.delete(id),
+    };
+    const context = {
+        console: { log() {}, warn() {}, error() {} }, document, window,
+        SillyTavern: { getContext: () => live },
+        MutationObserver: class { observe() {} disconnect() {} },
+        getVariables: () => clone(currentVariables),
+        insertOrAssignVariables: values => { currentVariables = { ...currentVariables, ...clone(values) }; },
+        getButtonEvent: name => `button:${name}`,
+        appendInexistentScriptButtons() {},
+        eventOn: (event, callback) => handlers.set(event, callback),
+        eventMakeLast: (event, callback) => handlers.set(event, callback),
+        tavern_events: events,
+        toastr: Object.fromEntries(['info', 'success', 'warning', 'error'].map(type => [type, (...args) => toasts.push({ type, args })])),
+        $(target) { if (typeof target === 'function') target(); return { on() {} }; },
+    };
+    vm.createContext(context);
+    vm.runInContext(source, context);
+    return {
+        api: context, live, document, textarea, prompts, saves, toasts,
+        get variables() { return currentVariables; },
+        set variables(value) { currentVariables = clone(value); },
+        async emit(event, ...args) {
+            assert.ok(handlers.has(event), `missing event ${event}`);
+            await handlers.get(event)(...args);
+            const callbacks = [...frames.values()];
+            frames.clear();
+            for (const callback of callbacks) callback();
         },
-    },
-    {
-        name: 'assistant',
-        is_user: false,
-        is_system: false,
-        mes: 'reply after tool',
-        send_date: '2026-08-10T10:04:00.000Z',
-        swipe_id: 0,
-        swipes: ['reply after tool'],
-        extra: {
-            reasoning: '<thinking>reasoning after tool</thinking>',
-            reasoning_duration: 34,
-            reasoning_signature: 'sig-b',
-        },
-    },
-];
-
-const extensionContext = {
-    setExtensionPrompt(...args) {
-        promptCalls.push(structuredClone(args));
-    },
-};
-
-const context = {
-    console,
-    document: documentMock,
-    window: windowMock,
-    structuredClone,
-    SillyTavern: {
-        chat,
-        getContext: () => extensionContext,
-    },
-    MutationObserver: class {
-        constructor(callback) {
-            this.callback = callback;
-        }
-        observe() {}
-        disconnect() {}
-    },
-    getVariables() {
-        return structuredClone(chatVariables);
-    },
-    insertOrAssignVariables(values) {
-        const copy = structuredClone(values);
-        variableWrites.push(copy);
-        chatVariables = { ...chatVariables, ...copy };
-    },
-    deleteVariable(variablePath, option) {
-        const deleteOccurred = Object.hasOwn(chatVariables, variablePath);
-        if (deleteOccurred) {
-            delete chatVariables[variablePath];
-        }
-        variableDeletes.push({ variablePath, option: structuredClone(option), deleteOccurred });
-        return {
-            variables: structuredClone(chatVariables),
-            delete_occurred: deleteOccurred,
-        };
-    },
-    appendInexistentScriptButtons(buttons) {
-        for (const button of buttons) {
-            if (!scriptButtons.some(current => current.name === button.name)) {
-                scriptButtons.push(structuredClone(button));
-            }
-        }
-    },
-    getButtonEvent: name => `button:${name}`,
-    eventOn(event, handler) {
-        handlers.set(event, handler);
-    },
-    eventMakeLast(event, handler) {
-        handlers.set(event, handler);
-    },
-    tavern_events: EVENT,
-    toastr: {
-        info(message, title) {
-            toastLog.push({ type: 'info', message, title });
-        },
-        success(message, title) {
-            toastLog.push({ type: 'success', message, title });
-        },
-        warning(message, title) {
-            toastLog.push({ type: 'warning', message, title });
-        },
-    },
-    $(target) {
-        if (typeof target === 'function') {
-            target();
-            return undefined;
-        }
-        return { on() {} };
-    },
-};
-
-vm.createContext(context);
-vm.runInContext(`${source}\n;globalThis.__counterV5 = {
-    isConversationMessage,
-    normalizeAwakeState,
-    buildCycleIndex,
-    buildGenerationSnapshot,
-    makeGenerationPrompt,
-    renderMessage,
-};`, context);
-
-const api = context.__counterV5;
-assert.deepEqual(scriptButtons, [
-    { name: '我醒了', visible: true },
-    { name: '校正计数', visible: true },
-    { name: '结束清醒', visible: true },
-]);
-
-async function flushTasks() {
-    await Promise.resolve();
-    await new Promise(resolve => setImmediate(resolve));
+        async wake() { await this.emit('button:我醒了'); },
+        index() { return context.buildCycleIndex(live.chat, context.normalizeAwakeState()); },
+        latestPrompt() { return prompts.at(-1)?.[1]; },
+    };
 }
 
-function serialized(value) {
-    return JSON.stringify(value);
+function message(user, index = 0, extra = {}) {
+    const text = `message ${index}\n<time>original time ${index}</time>${user ? '\n<idle>31 minutes</idle>' : ''}`;
+    return {
+        name: user ? 'user' : 'assistant', is_user: user, is_system: false, mes: text,
+        send_date: `2026-09-07T10:${String(index % 60).padStart(2, '0')}:00Z`,
+        ...(user ? {} : {
+            swipe_id: 0, swipes: [text, 'untouched alternate'],
+            variables: [{ selected: true }, { other: true }],
+            swipe_info: [{ extra: { reasoning: `selected reasoning ${index}`, reasoning_signature: 'signed' } }, { extra: { reasoning: 'alternate reasoning' } }],
+            extra: { reasoning: `selected reasoning ${index}`, reasoning_signature: 'signed', reasoning_duration: 12, image: 'keep.png', ...extra },
+        }),
+    };
 }
 
-async function runHandlerWithoutChatMutation(event, ...args) {
-    const handler = handlers.get(event);
-    assert.equal(typeof handler, 'function', `missing handler: ${event}`);
-    const before = serialized(chat);
-    await handler(...args);
-    await flushTasks();
-    assert.equal(serialized(chat), before, `${event} mutated chat data`);
+function metadata(chat) {
+    return chat.map(item => {
+        const copy = clone(item);
+        delete copy.mes;
+        if (copy.swipes) copy.swipes[copy.swipe_id ?? 0] = '<selected text>';
+        return copy;
+    });
 }
 
-function lastPromptCall() {
-    assert.ok(promptCalls.length > 0, 'expected a prompt call');
-    return promptCalls.at(-1);
+async function send(h, item) {
+    const id = h.live.chat.push(item) - 1;
+    await h.emit(item.is_user ? 'MESSAGE_SENT' : 'MESSAGE_RECEIVED', id, 'normal');
+    return id;
 }
 
-function assertPromptCoordinates({ userFloor, userOrdinal, replyFloor, replyOrdinal }) {
-    const [promptId, content, position, depth, scan, role] = lastPromptCall();
-    assert.equal(promptId, 'st_awake_message_coordinates_v5');
-    assert.equal(position, 1);
-    assert.equal(depth, 0);
-    assert.equal(scan, false);
-    assert.equal(role, 0);
-    assert.match(content, new RegExp(`第 #${userFloor} 楼`));
-    assert.match(content, new RegExp(`第 #${userOrdinal} 条`));
-    assert.match(content, new RegExp(`第 #${replyFloor} 楼`));
-    assert.match(content, new RegExp(`第 #${replyOrdinal} 条`));
-    assert.equal(content.split('\n').length, 3);
+function coordinates(text, floor, ordinal) {
+    assert.ok(text.endsWith(`<message_coordinates>[message_id: #${floor} | since_wake: ${ordinal === null ? 'unknown' : `#${ordinal}`}]</message_coordinates>`), text);
+    assert.equal((text.match(/<message_coordinates>/g) ?? []).length, 1);
 }
 
-await flushTasks();
-
-// A v1 state is interpreted as one v2 history entry without persisting anything.
-const normalized = api.normalizeAwakeState(structuredClone(oldCycle));
-assert.equal(normalized.version, 2);
-assert.equal(normalized.cycle_id, oldCycle.cycle_id);
-assert.equal(normalized.cycles.length, 1);
-assert.equal(normalized.cycles[0].cycle_id, oldCycle.cycle_id);
-assert.equal(variableWrites.length, 0);
-
-// System, narrator, and tool rows retain their real floors but do not consume awake ordinals.
-const initialChatSnapshot = serialized(chat);
-const initialIndex = api.buildCycleIndex(chat, normalized);
-assert.equal(initialIndex.currentCount, 3);
-assert.equal(initialIndex.byMessageId.get(3).ordinal, 1);
-assert.equal(initialIndex.byMessageId.get(4).ordinal, 2);
-assert.equal(initialIndex.byMessageId.get(7).ordinal, 3);
-assert.equal(initialIndex.byMessageId.has(2), false);
-assert.equal(initialIndex.byMessageId.has(5), false);
-assert.equal(initialIndex.byMessageId.has(6), false);
-assert.equal(serialized(chat), initialChatSnapshot);
-
-// The footer is a third sibling in .mes_block and never rewrites reasoning or message text.
-const reasoningNode = createDomNode('details');
-reasoningNode.className = 'mes_reasoning_details';
-reasoningNode.textContent = 'visible chain of thought';
-const textNode = createDomNode('div');
-textNode.className = 'mes_text';
-textNode.textContent = chat[4].mes;
-const branchFooter = createDomNode('div');
-branchFooter.className = 'th-message-marker-footer';
-const block = createDomNode('div');
-block.className = 'mes_block';
-block.children = [reasoningNode, textNode, branchFooter];
-for (const child of block.children) {
-    child.parentNode = block;
-}
-block.querySelector = selector => {
-    if (selector.includes('st-awake-message-coordinate-footer')) {
-        return block.children.find(child => child.classList.contains('st-awake-message-coordinate-footer')) ?? null;
-    }
-    return null;
-};
-block.insertBefore = (node, reference) => {
-    node.parentNode = block;
-    const index = reference ? block.children.indexOf(reference) : -1;
-    if (index >= 0) {
-        block.children.splice(index, 0, node);
-    } else {
-        block.children.push(node);
-    }
-};
-const messageElement = {
-    querySelector(selector) {
-        if (selector === ':scope > .mes_block') {
-            return block;
-        }
-        if (selector === ':scope > .mes_block > .mes_text') {
-            return textNode;
-        }
-        if (selector.includes('st-awake-message-coordinate-footer')) {
-            return block.querySelector(selector);
-        }
-        return null;
-    },
-    querySelectorAll() {
-        return [];
-    },
-};
-const reasoningBeforeRender = reasoningNode.textContent;
-const textBeforeRender = textNode.textContent;
-api.renderMessage(messageElement, 4, chat[4], initialIndex.byMessageId.get(4));
-assert.deepEqual(
-    block.children.map(node => node.className),
-    ['mes_reasoning_details', 'mes_text', 'st-awake-message-coordinate-footer', 'th-message-marker-footer'],
-);
-assert.equal(block.children[2].textContent, '[message_id: #4 | since_wake: #2]');
-assert.equal(reasoningNode.textContent, reasoningBeforeRender);
-assert.equal(textNode.textContent, textBeforeRender);
-api.renderMessage(messageElement, 4, chat[4], null);
-assert.equal(block.children[2].textContent, '[message_id: #4]');
-api.renderMessage(messageElement, 2, chat[2], null);
-assert.equal(block.children.some(node => node.classList.contains('st-awake-message-coordinate-footer')), false);
-
-// Normal send: before MESSAGE_SENT, the pending textarea predicts both new floors.
-textarea.value = 'new user message';
-await runHandlerWithoutChatMutation(EVENT.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
-assertPromptCoordinates({ userFloor: 8, userOrdinal: 4, replyFloor: 9, replyOrdinal: 5 });
-
-// MESSAGE_SENT occurs before prompt assembly, so the prompt is recomputed from the real chat row.
-const sentUser = {
-    name: 'user',
-    is_user: true,
-    is_system: false,
-    mes: 'new user message',
-    send_date: '2026-08-10T10:05:00.000Z',
-};
-chat.push(sentUser);
-textarea.value = '';
-await runHandlerWithoutChatMutation(EVENT.MESSAGE_SENT, 8);
-assertPromptCoordinates({ userFloor: 8, userOrdinal: 4, replyFloor: 9, replyOrdinal: 5 });
-
-const receivedAssistant = {
-    name: 'assistant',
-    is_user: false,
-    is_system: false,
-    mes: 'new assistant reply',
-    send_date: '2026-08-10T10:06:00.000Z',
-    swipe_id: 0,
-    swipes: ['new assistant reply'],
-    variables: [{ preserved: true }],
-    extra: {
-        reasoning: '<thinking>new reasoning</thinking>',
-        reasoning_duration: 56,
-        reasoning_signature: 'sig-c',
-    },
-};
-chat.push(receivedAssistant);
-await runHandlerWithoutChatMutation(EVENT.MESSAGE_RECEIVED, 9, 'normal');
-assert.equal(receivedAssistant.extra.reasoning, '<thinking>new reasoning</thinking>');
-await runHandlerWithoutChatMutation(EVENT.GENERATION_ENDED, 9);
-assert.equal(lastPromptCall()[1], '');
-
-// Roll keeps the same message floor and ordinal.
-await runHandlerWithoutChatMutation(EVENT.GENERATION_AFTER_COMMANDS, 'swipe', {}, false);
-assertPromptCoordinates({ userFloor: 8, userOrdinal: 4, replyFloor: 9, replyOrdinal: 5 });
-receivedAssistant.swipes.push('rolled assistant reply');
-receivedAssistant.swipe_id = 1;
-receivedAssistant.mes = 'rolled assistant reply';
-receivedAssistant.variables.push({ preserved: 'roll-b' });
-receivedAssistant.extra.reasoning = '<thinking>rolled reasoning</thinking>';
-receivedAssistant.extra.reasoning_signature = 'sig-roll-b';
-await runHandlerWithoutChatMutation(EVENT.MESSAGE_SWIPED, 9);
-assert.equal(receivedAssistant.extra.reasoning, '<thinking>rolled reasoning</thinking>');
-await runHandlerWithoutChatMutation(EVENT.GENERATION_ENDED, 9);
-
-// Regenerate deletes and recreates the last assistant at the same floor.
-await runHandlerWithoutChatMutation(EVENT.GENERATION_AFTER_COMMANDS, 'regenerate', {}, false);
-assertPromptCoordinates({ userFloor: 8, userOrdinal: 4, replyFloor: 9, replyOrdinal: 5 });
-chat.splice(9, 1);
-await runHandlerWithoutChatMutation(EVENT.MESSAGE_DELETED, 9);
-assertPromptCoordinates({ userFloor: 8, userOrdinal: 4, replyFloor: 9, replyOrdinal: 5 });
-const regeneratedAssistant = {
-    name: 'assistant',
-    is_user: false,
-    is_system: false,
-    mes: 'regenerated reply',
-    send_date: '2026-08-10T10:07:00.000Z',
-    swipe_id: 0,
-    swipes: ['regenerated reply'],
-    variables: [{ regenerated: true }],
-    extra: {
-        reasoning: '<thinking>regenerated reasoning</thinking>',
-        reasoning_duration: 78,
-        reasoning_signature: 'sig-regenerated',
-    },
-};
-chat.push(regeneratedAssistant);
-await runHandlerWithoutChatMutation(EVENT.MESSAGE_RECEIVED, 9, 'regenerate');
-assert.equal(regeneratedAssistant.extra.reasoning_signature, 'sig-regenerated');
-await runHandlerWithoutChatMutation(EVENT.GENERATION_ENDED, 9);
-
-// Continue appends to the existing assistant floor.
-await runHandlerWithoutChatMutation(EVENT.GENERATION_AFTER_COMMANDS, 'continue', {}, false);
-assertPromptCoordinates({ userFloor: 8, userOrdinal: 4, replyFloor: 9, replyOrdinal: 5 });
-regeneratedAssistant.mes += ' continued';
-regeneratedAssistant.swipes[0] = regeneratedAssistant.mes;
-regeneratedAssistant.extra.reasoning = '<thinking>continued reasoning</thinking>';
-await runHandlerWithoutChatMutation(EVENT.MESSAGE_RECEIVED, 9, 'continue');
-assert.equal(regeneratedAssistant.mes, 'regenerated reply continued');
-assert.equal(regeneratedAssistant.extra.reasoning, '<thinking>continued reasoning</thinking>');
-await runHandlerWithoutChatMutation(EVENT.GENERATION_STOPPED);
-assert.equal(lastPromptCall()[1], '');
-
-// Deleting a conversational row shifts real floors and recomputes ordinals in memory only.
-chat.splice(3, 1);
-await runHandlerWithoutChatMutation(EVENT.MESSAGE_DELETED, 3);
-const deletedIndex = api.buildCycleIndex(chat, api.normalizeAwakeState());
-assert.equal(deletedIndex.currentCount, 4);
-assert.equal(deletedIndex.byMessageId.get(3).ordinal, 1);
-assert.equal(deletedIndex.byMessageId.get(6).ordinal, 2);
-assert.equal(deletedIndex.byMessageId.get(7).ordinal, 3);
-assert.equal(deletedIndex.byMessageId.get(8).ordinal, 4);
-assert.equal(deletedIndex.byMessageId.has(2), false);
-assert.equal(deletedIndex.byMessageId.has(4), false);
-assert.equal(deletedIndex.byMessageId.has(5), false);
-assert.equal(variableWrites.length, 0);
-
-// Clicking the button is the only persistence path: it migrates v1 to v2 history.
-const beforeMigrationChat = serialized(chat);
-await runHandlerWithoutChatMutation('button:我醒了');
-assert.equal(serialized(chat), beforeMigrationChat);
-assert.equal(variableWrites.length, 1);
-const migrated = chatVariables.st_awake_message_counter;
-assert.equal(migrated.version, 2);
-assert.equal(migrated.cycles.length, 2);
-assert.equal(migrated.cycles[0].cycle_id, oldCycle.cycle_id);
-assert.ok(migrated.cycles[0].ended_at);
-assert.equal(migrated.cycles[1].cycle_id, migrated.cycle_id);
-assert.equal(migrated.start_message_id, chat.length);
-
-// A duplicate click before any new conversation row neither rewrites variables nor chat.
-await runHandlerWithoutChatMutation('button:我醒了');
-assert.equal(variableWrites.length, 1);
-await runHandlerWithoutChatMutation('button:校正计数');
-assert.equal(variableWrites.length, 1);
-
-// Ending awake deletes the state and suppresses all prompt coordinates until the next wake.
-await runHandlerWithoutChatMutation('button:结束清醒');
-assert.equal(variableDeletes.length, 1);
-assert.deepEqual(variableDeletes[0], {
-    variablePath: 'st_awake_message_counter',
-    option: { type: 'chat' },
-    deleteOccurred: true,
+test('only narrow text writes; no bulk message/branch/reasoning writer', () => {
+    assert.doesNotMatch(source, /setChatMessages|updateMessageBlock|swipes_data/);
+    assert.doesNotMatch(source, /\.(?:extra|reasoning|swipe_info|variables|swipes)\s*=/);
+    assert.equal(source.match(/message\.mes\s*=(?!=)/g).length, 1);
+    assert.equal(source.match(/message\.swipes\[swipeId\]\s*=(?!=)/g).length, 1);
 });
-assert.equal(chatVariables.st_awake_message_counter, undefined);
-assert.equal(lastPromptCall()[1], '');
 
-textarea.value = 'message while awake tracking is off';
-await runHandlerWithoutChatMutation(EVENT.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
-assert.equal(lastPromptCall()[1], '');
-textarea.value = '';
+test('wake arms next user; tags follow original time/idle; previous rows are unchanged', async () => {
+    const prior = message(false);
+    const h = harness({ chat: [prior] });
+    const before = clone(h.live.chat);
+    await h.wake();
+    const pending = clone(h.variables[STATE]);
+    await h.wake();
+    assert.deepEqual(h.variables[STATE], pending);
+    assert.deepEqual(h.live.chat, before);
+    const user = message(true, 1);
+    const original = user.mes;
+    await send(h, user);
+    assert.ok(user.mes.startsWith(original));
+    assert.match(user.mes, /<awake_start>amc-v1-[a-z0-9-]+<\/awake_start>/);
+    coordinates(user.mes, 1, 1);
+    assert.equal(h.variables[STATE].mode, 'active');
+    const assistant = message(false, 2);
+    const beforeMeta = metadata([assistant]);
+    const reasoning = assistant.extra;
+    await send(h, assistant);
+    coordinates(assistant.mes, 2, 2);
+    assert.equal(assistant.extra, reasoning);
+    assert.deepEqual(metadata([assistant]), beforeMeta);
+    assert.deepEqual(prior, before[0]);
+    assert.equal(h.index().currentCount, 2);
+});
 
-// Repeated ending is a no-op; waking again creates a fresh cycle at #1.
-await runHandlerWithoutChatMutation('button:结束清醒');
-assert.equal(variableDeletes.length, 1);
-await runHandlerWithoutChatMutation('button:我醒了');
-assert.equal(variableWrites.length, 2);
-assert.equal(chatVariables.st_awake_message_counter.version, 2);
-assert.equal(chatVariables.st_awake_message_counter.cycles.length, 1);
-assert.equal(chatVariables.st_awake_message_counter.start_message_id, chat.length);
+test('80 dialogue rows, hide first 40, then continue at 81/82; lost state recovers from hidden anchor', async () => {
+    const h = harness();
+    await h.wake();
+    await send(h, message(true));
+    for (let i = 1; i < 80; i++) h.live.chat.push(message(i % 2 === 0, i));
+    await h.emit('button:校正计数');
+    assert.equal(h.index().currentCount, 80);
+    for (const item of h.live.chat.slice(0, 40)) item.is_system = true;
+    h.variables = {};
+    const reloaded = harness({ chat: clone(h.live.chat), variables: {} });
+    assert.equal(reloaded.index().currentCount, 80);
+    await send(reloaded, message(true, 80));
+    await send(reloaded, message(false, 81));
+    coordinates(reloaded.live.chat[80].mes, 80, 81);
+    coordinates(reloaded.live.chat[81].mes, 81, 82);
+    assert.equal(reloaded.index().startMessageId, 0);
+    assert.equal(reloaded.live.chat.slice(0, 40).every(item => item.is_system), true);
+    await reloaded.emit('button:校正计数');
+    assert.equal(reloaded.index().currentCount, 82);
+});
 
-// Quiet and dry-run generations clear/skip the coordinate prompt.
-await runHandlerWithoutChatMutation(EVENT.GENERATION_AFTER_COMMANDS, 'quiet', {}, false);
-assert.equal(lastPromptCall()[1], '');
-await runHandlerWithoutChatMutation(EVENT.GENERATION_AFTER_COMMANDS, 'normal', {}, true);
-assert.equal(lastPromptCall()[1], '');
+test('system/tool rows occupy floors, not awake ordinals; empty tool metadata is not a tool row', async () => {
+    const h = harness();
+    await h.wake();
+    await send(h, message(true));
+    h.live.chat.push(
+        { name: 'SillyTavern System', is_system: true, mes: 'tool data', extra: { tool_invocations: [{ id: 'tool' }] } },
+        { ...message(false), extra: { type: 'narrator' } },
+        { ...message(false), extra: { type: 'comment' } },
+        { ...message(false), extra: { type: 'status' } },
+    );
+    const assistant = message(false, 5, { tool_invocations: [] });
+    await send(h, assistant);
+    coordinates(assistant.mes, 5, 2);
+    assert.equal(h.index().currentCount, 2);
+    assert.equal(h.live.chat.slice(1, 5).some(item => item.mes.includes('<message_coordinates>')), false);
+});
 
-process.stdout.write(JSON.stringify({
-    staticSafety: true,
-    initialAwakeCount: initialIndex.currentCount,
-    countAfterDeletion: deletedIndex.currentCount,
-    promptCalls: promptCalls.length,
-    variableWrites: variableWrites.length,
-    variableDeletes: variableDeletes.length,
-    scriptButtons: scriptButtons.map(button => button.name),
-    migratedCycles: migrated.cycles.length,
-    reasoningPreserved: true,
-    footerPlacement: block.children.map(node => node.className),
-    lastToast: toastLog.at(-1),
-}, null, 2));
+test('normal request sees stored tags and pending reply coordinates; no cycle still gets total coordinates', async () => {
+    const h = harness({ chat: [message(false)] });
+    await h.wake();
+    h.textarea.value = 'new user';
+    await h.emit('GENERATION_AFTER_COMMANDS', 'normal', {}, false);
+    assert.match(h.latestPrompt(), /第 #1 楼（本次清醒周期第 #1 条）/);
+    assert.match(h.latestPrompt(), /第 #2 楼（本次清醒周期第 #2 条）/);
+    h.textarea.value = '';
+    await send(h, message(true, 1));
+    coordinates(h.live.chat[1].mes, 1, 1);
+    await send(h, message(false, 2));
+    await h.emit('GENERATION_ENDED');
+    assert.equal(h.latestPrompt(), '');
+    const noCycle = harness({ chat: [message(true)] });
+    await noCycle.emit('GENERATION_AFTER_COMMANDS', 'normal', {}, false);
+    assert.match(noCycle.latestPrompt(), /第 #0 楼/);
+    assert.match(noCycle.latestPrompt(), /第 #1 楼/);
+    coordinates(noCycle.live.chat[0].mes, 0, null);
+});
+
+test('roll and continue preserve reasoning and branches; old timestamps cannot move a floor into a cycle', async () => {
+    const previous = message(false);
+    const h = harness({ chat: [previous] });
+    await h.wake();
+    await send(h, message(true, 1));
+    previous.send_date = '2099-01-01T00:00:00Z';
+    await h.emit('MESSAGE_SWIPED', 0);
+    coordinates(previous.mes, 0, null);
+    assert.equal(h.index().currentCount, 1);
+    const assistant = message(false, 2);
+    await send(h, assistant);
+    assistant.swipe_id = 1;
+    assistant.mes = assistant.swipes[1];
+    assistant.extra = { reasoning: 'other signed reasoning', reasoning_signature: 'other-signature' };
+    const untouchedBranch = assistant.swipes[0];
+    const before = metadata([assistant]);
+    await h.emit('MESSAGE_SWIPED', 2);
+    coordinates(assistant.mes, 2, 2);
+    assert.equal(assistant.swipes[0], untouchedBranch);
+    assert.deepEqual(metadata([assistant]), before);
+    await h.emit('GENERATION_AFTER_COMMANDS', 'continue', {}, false);
+    assert.match(h.latestPrompt(), /第 #2 楼（本次清醒周期第 #2 条）/);
+    const prose = h.api.stripCoordinateTags(assistant.mes);
+    assistant.mes += ' continued text';
+    assistant.swipes[1] = assistant.mes;
+    await h.emit('MESSAGE_RECEIVED', 2, 'continue');
+    assert.equal(h.api.stripCoordinateTags(assistant.mes), `${prose} continued text`);
+    await h.emit('GENERATION_ENDED');
+    assert.deepEqual(metadata([assistant]), before);
+    assert.equal(h.index().currentCount, 2);
+});
+
+test('deletion shifts floors and counts; deleting the anchor is warned about rather than guessed', async () => {
+    const h = harness({ chat: [message(false)] });
+    await h.wake();
+    await send(h, message(true, 1));
+    await send(h, message(false, 2));
+    await send(h, message(true, 3));
+    h.live.chat.splice(0, 1);
+    await h.emit('MESSAGE_DELETED', 0);
+    coordinates(h.live.chat[0].mes, 0, 1);
+    assert.equal(h.index().currentCount, 3);
+    h.live.chat.splice(1, 1);
+    await h.emit('MESSAGE_DELETED', 1);
+    coordinates(h.live.chat[1].mes, 1, 2);
+    h.live.chat.splice(0, 1);
+    await h.emit('button:校正计数');
+    assert.equal(h.index().currentCycleId, null);
+    assert.ok(h.index().missingAnchor);
+    assert.ok(h.toasts.some(toast => toast.type === 'warning' && toast.args[0].includes('起点标记')));
+});
+
+test('multiple wakes reset without sleep; ending persists a boundary and does not erase history', async () => {
+    const h = harness();
+    await h.wake();
+    await send(h, message(true));
+    await send(h, message(false, 1));
+    await h.wake();
+    await send(h, message(true, 2));
+    coordinates(h.live.chat[2].mes, 2, 1);
+    coordinates(h.live.chat[1].mes, 1, 2);
+    await h.emit('button:结束清醒');
+    await send(h, message(true, 3));
+    assert.match(h.live.chat[3].mes, /<awake_end>/);
+    coordinates(h.live.chat[3].mes, 3, null);
+    h.variables = {};
+    assert.equal(h.index().currentCycleId, null);
+    await h.wake();
+    await send(h, message(true, 4));
+    coordinates(h.live.chat[4].mes, 4, 1);
+});
+
+test('pending survives reload; bot echoes, quoted examples, and duplicate IDs do not reset the cycle', async () => {
+    let h = harness({ chat: [message(false)] });
+    await h.wake();
+    h = harness({ chat: clone(h.live.chat), variables: h.variables });
+    await send(h, message(true, 1));
+    const marker = h.live.chat[1].mes.match(/<awake_start>.*?<\/awake_start>/)[0];
+    const echo = message(false, 2);
+    echo.mes += `\n\n${marker}`;
+    await send(h, echo);
+    const quoted = message(true, 3);
+    quoted.mes += '\n\n```xml\n<awake_start>amc-v1-example</awake_start>\n<message_coordinates>[message_id: #1 | since_wake: #1]</message_coordinates>\n```';
+    const originalQuote = quoted.mes;
+    await send(h, quoted);
+    assert.ok(quoted.mes.startsWith(originalQuote));
+    const duplicate = message(true, 4);
+    duplicate.mes += `\n\n${marker}`;
+    await send(h, duplicate);
+    assert.equal(h.index().currentCount, 4);
+    assert.equal(h.index().countsByCycle.size, 1);
+});
+
+test('save failure keeps pending intent; correction retries without duplicating anchor', async () => {
+    let fail = true;
+    const h = harness({ saveHook: () => { if (fail) throw new Error('offline'); } });
+    await h.wake();
+    await send(h, message(true));
+    assert.equal(h.variables[STATE].mode, 'pending');
+    assert.ok(h.toasts.some(toast => toast.type === 'error'));
+    fail = false;
+    await h.emit('button:校正计数');
+    assert.equal(h.variables[STATE].mode, 'active');
+    assert.equal((h.live.chat[0].mes.match(/<awake_start>/g) ?? []).length, 1);
+    assert.equal(h.saves.length, 1);
+});
+
+test('chat switch during save never writes pending state into the destination chat', async () => {
+    let release;
+    let started;
+    const entered = new Promise(resolve => { started = resolve; });
+    const wait = new Promise(resolve => { release = resolve; });
+    const h = harness({ saveHook: async () => { started(); await wait; } });
+    await h.wake();
+    h.live.chat.push(message(true));
+    const saving = h.emit('MESSAGE_SENT', 0);
+    await entered;
+    h.live.chatId = 'chat-b';
+    h.live.chat = [message(false, 20)];
+    h.variables = {};
+    const before = clone(h.live.chat);
+    await h.emit('CHAT_CHANGED');
+    release();
+    await saving;
+    assert.deepEqual(h.variables, {});
+    assert.deepEqual(h.live.chat, before);
+    assert.equal(h.saves[0].chatId, 'chat-a');
+});
+
+test('quiet/dry run and initialization do not rewrite messages; malformed old state is not guessed', async () => {
+    const h = harness({ chat: [message(true)], variables: { [STATE]: { version: 2, cycle_id: 'old', start_message_id: 0 } } });
+    const before = clone(h.live.chat);
+    await h.emit('GENERATION_AFTER_COMMANDS', 'quiet', {}, false);
+    await h.emit('GENERATION_ENDED');
+    await h.emit('GENERATION_AFTER_COMMANDS', 'normal', {}, true);
+    await h.emit('GENERATION_ENDED');
+    assert.deepEqual(h.live.chat, before);
+    assert.equal(h.latestPrompt(), '');
+    assert.equal(h.saves.length, 0);
+    assert.equal(h.index().currentCycleId, null);
+});
+
+test('regeneration replaces the same floor; blank streaming placeholders are not rewritten', async () => {
+    const h = harness();
+    await h.wake();
+    await send(h, message(true));
+    await send(h, message(false, 1));
+    await h.emit('GENERATION_AFTER_COMMANDS', 'regenerate', {}, false);
+    h.live.chat.pop();
+    await h.emit('MESSAGE_DELETED', 1);
+    assert.match(h.latestPrompt(), /第 #1 楼（本次清醒周期第 #2 条）/);
+    const replacement = message(false, 1);
+    replacement.mes = '';
+    replacement.swipes = [''];
+    h.live.chat.push(replacement);
+    await h.emit('MESSAGE_SWIPED', 1);
+    assert.equal(replacement.mes, '');
+    assert.deepEqual(replacement.swipes, ['']);
+    replacement.mes = 'regenerated text\n<time>original</time>';
+    replacement.swipes[0] = replacement.mes;
+    await h.emit('MESSAGE_RECEIVED', 1);
+    await h.emit('GENERATION_ENDED');
+    coordinates(replacement.mes, 1, 2);
+    assert.equal(h.index().currentCount, 2);
+});
+
+test('already correct tails are idempotent; correction does not issue redundant saves', async () => {
+    const h = harness();
+    await h.wake();
+    await send(h, message(true));
+    await send(h, message(false, 1));
+    const before = clone(h.live.chat);
+    const saves = h.saves.length;
+    await h.emit('button:校正计数');
+    await h.emit('button:校正计数');
+    assert.deepEqual(h.live.chat, before);
+    assert.equal(h.saves.length, saves);
+});
+
+test('large multi-cycle history is recovered in order, independently of dates and visibility', () => {
+    const chat = Array.from({ length: 10430 }, (_, id) => message(id % 2 === 0, id));
+    for (let id = 0; id < chat.length; id++) {
+        chat[id].is_system = id < 10350;
+        if (id % 200 === 0) chat[id].mes += `\n\n<awake_start>amc-v1-cycle-${id}</awake_start>`;
+    }
+    const h = harness({ chat });
+    const index = h.index();
+    assert.equal(index.countsByCycle.size, 53);
+    assert.equal(index.startMessageId, 10400);
+    assert.equal(index.currentCount, 30);
+    assert.equal(index.byMessageId.get(10429).ordinal, 30);
+});
+
+test('footer updates never replace message text or reasoning DOM', () => {
+    const h = harness({ chat: [message(false)] });
+    const reasoning = node('details');
+    reasoning.className = 'mes_reasoning_details';
+    reasoning.textContent = 'visible reasoning';
+    const text = node();
+    text.className = 'mes_text';
+    text.textContent = 'original rendered reply';
+    const block = node();
+    block.children = [reasoning, text];
+    block.querySelector = () => block.children.find(child => child.className.includes('st-awake-message-coordinate-footer'));
+    block.insertBefore = child => { child.parentNode = block; block.children.push(child); };
+    const element = {
+        querySelector: selector => selector.endsWith('.mes_block') ? block : selector.endsWith('.mes_text') ? text : block.querySelector(),
+        querySelectorAll: () => [],
+    };
+    h.api.renderMessage(element, 0, h.live.chat[0], { ordinal: 2 });
+    assert.equal(block.children[0], reasoning);
+    assert.equal(block.children[1], text);
+    assert.equal(reasoning.textContent, 'visible reasoning');
+    assert.equal(text.textContent, 'original rendered reply');
+    assert.equal(block.children[2].textContent, '[message_id: #0 | since_wake: #2]');
+});
