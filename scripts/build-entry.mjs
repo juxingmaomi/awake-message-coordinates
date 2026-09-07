@@ -37,7 +37,10 @@ if (process.argv[2]) {
         content: core,
         info: `LOCAL TEST, disabled by default. Enable only one version of this script. ${description}`,
     };
+    const entryFile = path.join(output, 'awake-message-coordinates-entry.json');
     const outputFile = path.join(output, `awake-message-coordinates-${version}-local.json`);
+    await fs.writeFile(entryFile, `${JSON.stringify(entry, null, 2)}\n`, 'utf8');
     await fs.writeFile(outputFile, `${JSON.stringify(local, null, 2)}\n`, 'utf8');
+    console.log(entryFile);
     console.log(outputFile);
 }

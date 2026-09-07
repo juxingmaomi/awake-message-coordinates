@@ -1,10 +1,10 @@
 // == TavernHelper Script ==
 // name: 消息编号与清醒周期（消息锚点版）
 // author: Codex
-// version: v1.2.0
-// description: 从消息中的清醒标记恢复计数；仅更新正文尾标，不重绘或修改 reasoning。
+// version: v1.3.0
+// description: 消息锚点计数、睡醒时间同步与补记；保留历史周期和 reasoning。
 
-const SCRIPT_VERSION = 'v1.2.0';
+const SCRIPT_VERSION = 'v1.3.0';
 
 const SCRIPT_LABEL = '消息编号与清醒周期';
 const STATE_KEY = 'st_awake_message_counter';
@@ -12,6 +12,9 @@ const PROMPT_ID = 'st_awake_message_coordinates_v5';
 const STYLE_ID = 'st-awake-message-coordinate-style';
 const FOOTER_CLASS = 'st-awake-message-coordinate-footer';
 const LEGACY_HIDDEN_CLASS = 'st-awake-message-coordinate-legacy-hidden';
+const CORRECTION_CLASS = 'st-awake-correction';
+const WAKE_OPEN = '<薇薇睡醒时间>';
+const WAKE_CLOSE = '</薇薇睡醒时间>';
 const SYSTEM_MESSAGE_NAME = 'SillyTavern System';
 const LEGACY_MARKER_PATTERN = /\[message_id:\s*#(\d+)(?:\s*\|\s*since_wake:\s*(?:#(\d+)|unknown))?\]/g;
 const LEGACY_MARKER_EXACT_PATTERN = /^\[message_id:\s*#\d+(?:\s*\|\s*since_wake:\s*(?:#\d+|unknown))?\]\s*$/;
@@ -33,6 +36,9 @@ let promptRevision = 0;
 let cycleCache = null;
 let saveQueue = Promise.resolve();
 let disposed = false;
+let wakeAction = false;
+let correctionPopup = null;
+let chatRevision = 0;
 const textCache = new WeakMap();
 const unsavedChats = new Set();
 
@@ -85,8 +91,10 @@ function normalizeAwakeState(value = getRawAwakeState()) {
     if (!value || value.version !== 3) {
         return null;
     }
+    const wake = normalizeWakeTime(value.wake);
+    const time = wake ? { wake } : {};
     if (value.mode === 'pending' && /^(start|end)$/.test(value.kind) && /^amc-v1-[a-z0-9-]+$/.test(value.id)) {
-        return { version: 3, mode: 'pending', kind: value.kind, id: value.id };
+        return { version: 3, mode: 'pending', kind: value.kind, id: value.id, ...time };
     }
     if (value.mode !== 'active' || !/^amc-v1-[a-z0-9-]+$/.test(value.last_boundary_id)) {
         return null;
@@ -95,12 +103,189 @@ function normalizeAwakeState(value = getRawAwakeState()) {
         version: 3,
         mode: 'active',
         last_boundary_id: value.last_boundary_id,
+        ...time,
     };
 }
 
 function saveAwakeState(state) {
-    insertOrAssignVariables({ [STATE_KEY]: state }, { type: 'chat' });
+    // Replace our record, not other chat variables; deep merging would retain stale pending fields.
+    updateVariablesWith(variables => ({ ...variables, [STATE_KEY]: state }), { type: 'chat' });
     cycleCache = null;
+}
+
+function parseWakeTime(date, hour) {
+    const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date));
+    if (!parts || !/^\d{1,2}$/.test(String(hour))) {
+        throw new Error('请填写睡醒日期，并选择 0 到 23 点。');
+    }
+    const [, year, month, day] = parts.map(Number);
+    const value = new Date(year, month - 1, day, Number(hour));
+    if (
+        year < 1000 || value.getFullYear() !== year || value.getMonth() !== month - 1 ||
+        value.getDate() !== day || value.getHours() !== Number(hour) || Number(hour) > 23
+    ) {
+        throw new Error('睡醒日期或小时无效。');
+    }
+    return { date: String(date), hour: Number(hour), year, month, day, value };
+}
+
+function localWakeTime(now = new Date()) {
+    const pad = value => String(value).padStart(2, '0');
+    return {
+        date: `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`,
+        hour: now.getHours(),
+    };
+}
+
+function formatWakeTime(date, hour) {
+    const time = parseWakeTime(date, hour);
+    return `${time.month}月${time.day}日 ${time.hour}点`;
+}
+
+function normalizeWakeTime(value) {
+    if (!value || !/^amc-v1-[a-z0-9-]+$/.test(value.anchor_id)) return null;
+    try {
+        const time = parseWakeTime(value.date, value.hour);
+        return {
+            anchor_id: value.anchor_id,
+            date: time.date,
+            hour: time.hour,
+            preset_name: typeof value.preset_name === 'string' ? value.preset_name : null,
+            prompt_id: typeof value.prompt_id === 'string' ? value.prompt_id : null,
+            needs_sync: value.needs_sync === true,
+        };
+    } catch (_) {
+        return null;
+    }
+}
+
+function replaceWakeDateLine(content, date, hour) {
+    const start = content.indexOf(WAKE_OPEN);
+    const close = content.indexOf(WAKE_CLOSE);
+    if (
+        start < 0 || close <= start ||
+        content.indexOf(WAKE_OPEN, start + WAKE_OPEN.length) !== -1 ||
+        content.indexOf(WAKE_CLOSE, close + WAKE_CLOSE.length) !== -1
+    ) {
+        throw new Error('睡醒时间条目中的标签缺失或重复；没有修改预设。');
+    }
+    const bodyStart = start + WAKE_OPEN.length;
+    const body = content.slice(bodyStart, close);
+    const offset = body.match(/^\s*/)[0].length;
+    const original = body.slice(offset).split(/\r?\n/, 1)[0].trimEnd();
+    const dateLine = /^(?:\d{4}年\s*)?\d{1,2}月\s*\d{1,2}日\s*(?:(?:凌晨|早上|早晨|上午|中午|下午|傍晚|晚上|夜里|深夜)\s*)?\d{1,2}(?:点(?:\d{1,2}分?)?|[:：]\d{2})(?:整)?$/;
+    if (!dateLine.test(original) && !/^(?:未知|未记录|尚未记录)$/.test(original)) {
+        throw new Error('标签内第一行不是可识别的睡醒日期；没有修改预设。');
+    }
+    const at = bodyStart + offset;
+    return content.slice(0, at) + formatWakeTime(date, hour) + content.slice(at + original.length);
+}
+
+function findWakePrompt(preset) {
+    const prompts = preset?.prompts?.filter(prompt => (
+        typeof prompt?.content === 'string' &&
+        (prompt.content.includes(WAKE_OPEN) || prompt.content.includes(WAKE_CLOSE))
+    )) ?? [];
+    if (prompts.length !== 1 || typeof prompts[0].identifier !== 'string') {
+        throw new Error('当前预设需要有唯一的 <薇薇睡醒时间> 条目；计数功能仍可使用。');
+    }
+    return prompts[0];
+}
+
+function captureChatSession() {
+    return { key: getChatKey(), chat: getChat() };
+}
+
+function isCurrentSession(session) {
+    return !disposed && session.key === getChatKey() && session.chat === getChat();
+}
+
+function selectedPresetName(context = getContext()) {
+    return context?.getPresetManager?.('openai')?.getSelectedPresetName?.() || null;
+}
+
+function getWakePreset(wake = null) {
+    const context = getContext();
+    const manager = context?.getPresetManager?.('openai');
+    if (
+        context?.mainApi !== 'openai' || typeof manager?.getCompletionPresetByName !== 'function' ||
+        typeof manager?.savePreset !== 'function' || typeof context.saveSettingsDebounced !== 'function'
+    ) {
+        throw new Error('当前未使用支持同步的聊天补全预设；计数功能仍可使用。');
+    }
+    const name = manager.getSelectedPresetName();
+    if (!name || (wake?.preset_name && wake.preset_name !== name)) {
+        throw new Error('当前预设与记录时不同，未向其他预设写入时间。可在“校正计数”中重新确认。');
+    }
+    const saved = manager.getCompletionPresetByName(name);
+    const live = context.chatCompletionSettings;
+    const prompt = findWakePrompt(live);
+    const storedPrompt = findWakePrompt(saved);
+    if (prompt.identifier !== storedPrompt.identifier || (wake?.prompt_id && wake.prompt_id !== prompt.identifier)) {
+        throw new Error('睡醒时间条目与已保存预设不一致。请先保存预设，再重试同步。');
+    }
+    return { context, manager, name, saved, live, prompt, storedPrompt };
+}
+
+function makeWakeRecord(anchorId, time) {
+    return {
+        anchor_id: anchorId, date: time.date, hour: time.hour,
+        preset_name: selectedPresetName(), prompt_id: null, needs_sync: true,
+    };
+}
+
+async function syncWakePreset(wake, session, { retry = false } = {}) {
+    if (!isCurrentSession(session)) return false;
+    const target = getWakePreset(wake);
+    const { context, manager, name, saved, live, prompt, storedPrompt } = target;
+    const original = storedPrompt.content;
+    const nextLive = replaceWakeDateLine(prompt.content, wake.date, wake.hour);
+    const nextStored = replaceWakeDateLine(original, wake.date, wake.hour);
+    if (retry && nextLive !== prompt.content) {
+        throw new Error('预设里的时间与待同步记录不同，未自动覆盖。请在补记窗口中确认睡醒时间。');
+    }
+    // Preserve raw preset fields, unused prompts, order, and unsaved live edits independently.
+    const copy = structuredClone(saved);
+    findWakePrompt(copy).content = nextStored;
+    const sameWake = () => {
+        const current = normalizeAwakeState()?.wake;
+        return isCurrentSession(session) && current?.anchor_id === wake.anchor_id &&
+            current.date === wake.date && current.hour === wake.hour &&
+            selectedPresetName() === name && getContext().chatCompletionSettings?.prompts?.includes(prompt);
+    };
+    const bound = { ...wake, preset_name: name, prompt_id: prompt.identifier, needs_sync: true };
+    if (sameWake()) saveAwakeState({ ...normalizeAwakeState(), wake: bound });
+    if (prompt.content !== nextLive) {
+        prompt.content = nextLive;
+    }
+    context.saveSettingsDebounced();
+    // skipUpdate prevents switching/reloading the preset and overwriting unrelated live settings.
+    await manager.savePreset(name, copy, { skipUpdate: true });
+    const cached = manager.getCompletionPresetByName(name);
+    const cachedPrompt = cached?.prompts?.find(item => item.identifier === prompt.identifier);
+    if (!cachedPrompt || (cachedPrompt.content !== original && cachedPrompt.content !== nextStored)) {
+        throw new Error('保存期间预设又被编辑了；未覆盖后来的编辑，请重新校正。');
+    }
+    cachedPrompt.content = nextStored;
+    if (!sameWake()) return false;
+    saveAwakeState({ ...normalizeAwakeState(), wake: { ...bound, needs_sync: false } });
+    const order = live.prompt_order?.find(item => Number(item.character_id) === 100001)?.order;
+    if (order && !order.some(item => item.identifier === prompt.identifier && item.enabled === true)) {
+        toastr.warning('睡醒时间已保存，但该条目未启用，不会发送给模型。', SCRIPT_LABEL);
+    }
+    return true;
+}
+
+async function trySyncWakePreset(wake, session, options) {
+    try {
+        return await syncWakePreset(wake, session, options);
+    } catch (error) {
+        console.warn(`[${SCRIPT_LABEL}] 睡醒时间同步未完成。`, error);
+        if (isCurrentSession(session)) {
+            toastr.warning(`睡醒记录已保留，预设同步未完成：${error.message} 可用“校正计数”重试。`, SCRIPT_LABEL);
+        }
+        return false;
+    }
 }
 
 function readMessageTags(message) {
@@ -138,6 +323,7 @@ function buildCycleIndex(chat = getChat(), state = normalizeAwakeState()) {
     const byMessageId = new Map();
     const countsByCycle = new Map();
     const boundaryIds = new Set();
+    const boundaries = [];
     let currentCycleId = null;
     let lastBoundaryId = null;
     let startMessageId = null;
@@ -149,6 +335,7 @@ function buildCycleIndex(chat = getChat(), state = normalizeAwakeState()) {
             for (const boundary of readMessageTags(message).boundaries) {
                 if (boundaryIds.has(boundary.id)) continue;
                 boundaryIds.add(boundary.id);
+                boundaries.push({ ...boundary, messageId });
                 lastBoundaryId = boundary.id;
                 currentCycleId = boundary.kind === 'start' ? boundary.id : null;
                 startMessageId = currentCycleId ? messageId : null;
@@ -170,6 +357,7 @@ function buildCycleIndex(chat = getChat(), state = normalizeAwakeState()) {
         byMessageId,
         countsByCycle,
         boundaryIds,
+        boundaries,
         lastBoundaryId,
         currentCycleId,
         detectedCycleId,
@@ -229,6 +417,33 @@ function writeMessageText(message, text) {
     return true;
 }
 
+async function verifySavedBoundary(context, boundary) {
+    const character = context.characters?.[context.characterId];
+    if (typeof context.getRequestHeaders !== 'function' || (!context.groupId && !character?.avatar)) {
+        throw new Error('缺少聊天回读接口，无法确认起点已保存；请保留当前页面并重试。');
+    }
+    const response = await window.parent.fetch(context.groupId ? '/api/chats/group/get' : '/api/chats/get', {
+        method: 'POST',
+        headers: context.getRequestHeaders(),
+        cache: 'no-cache',
+        signal: AbortSignal.timeout(10000),
+        body: JSON.stringify(context.groupId ? { id: context.chatId } : {
+            ch_name: character.name, file_name: context.chatId, avatar_url: character.avatar,
+        }),
+    });
+    if (!response.ok) throw new Error('起点保存后回读失败；请保留当前页面，用“校正计数”重试。');
+    const data = await response.json();
+    if (!Array.isArray(data)) throw new Error('聊天回读结果无效；尚未确认起点保存成功。');
+    const stored = context.groupId ? data : data.slice(1);
+    const message = stored[boundary.messageId];
+    if (
+        !isConversationMessage(message) || message.is_user !== true ||
+        !readMessageTags(message).boundaries.some(item => item.id === boundary.id && item.kind === boundary.kind)
+    ) {
+        throw new Error('服务器聊天中尚未找到本次起点；请保留当前页面，用“校正计数”重试。');
+    }
+}
+
 async function synchronizeMessages({ messageId = null, capturePending = false, repair = false } = {}) {
     if (disposed) return;
     const context = getContext();
@@ -270,18 +485,32 @@ async function synchronizeMessages({ messageId = null, capturePending = false, r
         unsavedChats.add(key);
         cycleCache = null;
     }
+    const stateToConfirm = normalizeAwakeState();
+    if (stateToConfirm?.mode === 'pending' && index.boundaryIds.has(stateToConfirm.id)) {
+        unsavedChats.add(key);
+    }
     scheduleRender();
     if (!unsavedChats.has(key)) return;
     // Serialize saves and re-check chat identity before touching chat-scoped state after an await.
     const save = saveQueue.then(async () => {
         if (disposed || getChatKey() !== key || getChat() !== chat) return;
+        const beforeSave = normalizeAwakeState();
+        const boundary = beforeSave?.mode === 'pending'
+            ? getCycleIndex().boundaries.find(item => item.id === beforeSave.id)
+            : null;
         await context.saveChat();
+        if (disposed || getChatKey() !== key || getChat() !== chat) return;
+        // Core saveChat can swallow server errors. Read back only when confirming a new boundary.
+        if (boundary) await verifySavedBoundary(context, boundary);
         if (disposed || getChatKey() !== key || getChat() !== chat) return;
         unsavedChats.delete(key);
         const state = normalizeAwakeState();
         const latest = getCycleIndex();
-        if (state?.mode === 'pending' && latest.boundaryIds.has(state.id)) {
-            saveAwakeState({ version: 3, mode: 'active', last_boundary_id: state.id });
+        if (state?.mode === 'pending' && state.id === boundary?.id && latest.boundaryIds.has(state.id)) {
+            saveAwakeState({
+                version: 3, mode: 'active', last_boundary_id: state.id,
+                ...(state.wake ? { wake: state.wake } : {}),
+            });
         }
     });
     saveQueue = save.catch(() => {});
@@ -337,6 +566,61 @@ function installStyle() {
 .${LEGACY_HIDDEN_CLASS} {
     display: none !important;
 }
+
+.${CORRECTION_CLASS} {
+    display: grid;
+    gap: 0.85rem;
+    width: 100%;
+    max-width: 32rem;
+    min-width: 0;
+    margin: 0 auto;
+    text-align: left;
+    letter-spacing: 0;
+    overflow-wrap: anywhere;
+}
+.${CORRECTION_CLASS} h3 { margin: 0; font-size: 1.15rem; }
+.${CORRECTION_CLASS} p { margin: 0; }
+.${CORRECTION_CLASS} label { display: grid; gap: 0.35rem; min-width: 0; }
+.${CORRECTION_CLASS} .amc-modes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.65rem 1.1rem;
+}
+.${CORRECTION_CLASS} .amc-modes label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+}
+.${CORRECTION_CLASS} .amc-time-fields {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(5.5rem, 0.65fr);
+    gap: 0.65rem;
+}
+.${CORRECTION_CLASS} input,
+.${CORRECTION_CLASS} select {
+    box-sizing: border-box;
+    min-width: 0;
+    max-width: 100%;
+    width: 100%;
+    margin: 0;
+    min-height: 2.4rem;
+    font: inherit;
+    letter-spacing: 0;
+}
+.${CORRECTION_CLASS} input[type="radio"] {
+    width: 1rem;
+    min-height: 1rem;
+    flex: 0 0 1rem;
+}
+.${CORRECTION_CLASS} .amc-preview {
+    white-space: pre-wrap;
+    max-height: 6rem;
+    overflow-y: auto;
+    font-size: 0.9em;
+}
+.${CORRECTION_CLASS} .amc-status { opacity: 0.8; font-size: 0.9em; }
+.${CORRECTION_CLASS} .amc-error { color: var(--warning, #d98972); }
+.${CORRECTION_CLASS} [hidden] { display: none; }
 
 @media (max-width: 600px) {
     .${FOOTER_CLASS} {
@@ -655,60 +939,311 @@ async function clearGenerationPrompt() {
     await setCoordinatePrompt('');
 }
 
-function armBoundary(kind) {
+function assertAwakeAvailable() {
     const context = getContext();
     if (!context?.chatId) {
-        toastr.warning('请先打开一个聊天。', SCRIPT_LABEL);
-        return;
+        throw new Error('请先打开一个聊天。');
     }
     const streaming = context.streamingProcessor;
     if ((streaming && !streaming.isFinished && !streaming.isStopped) || activeGeneration) {
-        toastr.warning('请等本次回复结束后再设置起点。', SCRIPT_LABEL);
-        return;
+        throw new Error('请等本次回复结束后再设置清醒记录。');
     }
-    const state = normalizeAwakeState();
-    const index = getCycleIndex();
-    if (state?.mode === 'pending' && state.kind === kind && !index.boundaryIds.has(state.id)) {
-        toastr.info('已经准备好，等待下一条你发送的消息。', SCRIPT_LABEL);
-        return;
-    }
-    const id = `amc-v1-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-    saveAwakeState({ version: 3, mode: 'pending', kind, id });
-    scheduleRender();
-    toastr.success(
-        kind === 'start'
-            ? '下一条你发送的消息将保存清醒起点，并从 #1 开始计数。'
-            : '下一条你发送的消息将保存结束标记；以后仍保留总编号。',
-        SCRIPT_LABEL,
-    );
 }
 
-function startAwakeCycle() {
-    armBoundary('start');
+function createBoundaryId() {
+    return `amc-v1-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function canStartAwakeAction() {
+    try {
+        assertAwakeAvailable();
+        if (wakeAction || correctionPopup) throw new Error('请先完成当前的清醒记录操作。');
+        return true;
+    } catch (error) {
+        toastr.warning(error.message, SCRIPT_LABEL);
+        return false;
+    }
+}
+
+async function startAwakeCycle() {
+    if (!canStartAwakeAction()) return;
+    wakeAction = true;
+    const session = captureChatSession();
+    try {
+        let state = normalizeAwakeState();
+        const index = getCycleIndex();
+        if (state?.mode === 'pending' && state.kind === 'start') {
+            if (index.boundaryIds.has(state.id)) {
+                await synchronizeMessages({ repair: true });
+                if (isCurrentSession(session)) toastr.info('已重试保存这次清醒起点，没有新建周期。', SCRIPT_LABEL);
+                return;
+            }
+            if (state.wake?.needs_sync) await trySyncWakePreset(state.wake, session, { retry: true });
+            if (isCurrentSession(session)) toastr.info('已经准备好，等待下一条你发送的消息。', SCRIPT_LABEL);
+            return;
+        }
+        const id = createBoundaryId();
+        state = { version: 3, mode: 'pending', kind: 'start', id, wake: makeWakeRecord(id, localWakeTime()) };
+        saveAwakeState(state);
+        scheduleRender();
+        const synced = await trySyncWakePreset(state.wake, session);
+        if (!isCurrentSession(session)) return;
+        toastr.success(
+            `${synced ? `睡醒时间已同步：${formatWakeTime(state.wake.date, state.wake.hour)}。` : ''}下一条你发送的消息从 #1 开始计数。`,
+            SCRIPT_LABEL,
+        );
+    } finally {
+        wakeAction = false;
+    }
 }
 
 function endAwakeCycle() {
-    armBoundary('end');
+    if (!canStartAwakeAction()) return;
+    const state = normalizeAwakeState();
+    const index = getCycleIndex();
+    if (state?.mode === 'pending' && state.kind === 'end' && !index.boundaryIds.has(state.id)) {
+        toastr.info('已经准备好，等待下一条你发送的消息。', SCRIPT_LABEL);
+        return;
+    }
+    saveAwakeState({
+        version: 3, mode: 'pending', kind: 'end', id: createBoundaryId(),
+        ...(state?.wake ? { wake: state.wake } : {}),
+    });
+    scheduleRender();
+    toastr.success('下一条你发送的消息将保存结束标记；以后仍保留总编号。', SCRIPT_LABEL);
+}
+
+function correctionSnapshot() {
+    return { session: captureChatSession(), revision: chatRevision, presetName: selectedPresetName() };
+}
+
+function assertCorrectionCurrent(snapshot) {
+    assertAwakeAvailable();
+    if (!isCurrentSession(snapshot.session) || snapshot.revision !== chatRevision) {
+        throw new Error('聊天已切换或消息已变化。请关闭后重新点“校正计数”。');
+    }
+    if (snapshot.presetName !== selectedPresetName()) {
+        throw new Error('预设已切换。请关闭后重新点“校正计数”。');
+    }
+}
+
+async function applyWakeCorrection({ mode, messageId, date, hour }, snapshot) {
+    assertCorrectionCurrent(snapshot);
+    const time = parseWakeTime(date, hour);
+    if (time.value.getTime() > Date.now()) throw new Error('睡醒时间不能晚于现在。');
+    const target = getWakePreset();
+    replaceWakeDateLine(target.prompt.content, date, hour);
+    replaceWakeDateLine(target.storedPrompt.content, date, hour);
+    const chat = getChat();
+    const state = normalizeAwakeState();
+    cycleCache = null;
+    const index = getCycleIndex();
+    let id;
+    let next;
+    if (mode === 'new') {
+        const message = chat[messageId];
+        if (!Number.isInteger(messageId) || !isConversationMessage(message) || message.is_user !== true) {
+            throw new Error('请选择醒来后的第一条用户消息。');
+        }
+        id = state?.mode === 'pending' && state.kind === 'start' ? state.id : createBoundaryId();
+        if (index.boundaries.some(boundary => boundary.messageId >= messageId && boundary.id !== id)) {
+            throw new Error('这条消息或后面已有清醒标记。若要移动本轮起点，请先移动正文标记，再选择“修改本轮”。');
+        }
+        if (!index.boundaryIds.has(id)) {
+            writeMessageText(message, `${stripCoordinateTags(message.mes)}\n\n<awake_start>${id}</awake_start>`);
+            unsavedChats.add(snapshot.session.key);
+        } else if (!readMessageTags(message).boundaries.some(boundary => boundary.id === id)) {
+            throw new Error('待保存的起点在另一条消息中。请先完成该起点的保存。');
+        }
+        next = { version: 3, mode: 'pending', kind: 'start', id };
+    } else if (mode === 'edit') {
+        id = index.pending?.kind === 'start' ? index.pending.id : index.currentCycleId;
+        if (!id) throw new Error('没有可以修改的本轮起点，请选择“补记睡醒”。');
+        next = index.pending?.kind === 'start'
+            ? { ...index.pending }
+            : { version: 3, mode: 'active', last_boundary_id: index.lastBoundaryId };
+    } else {
+        throw new Error('请选择补记或修改本轮。');
+    }
+    const wake = { ...makeWakeRecord(id, time), preset_name: target.name, prompt_id: target.prompt.identifier };
+    saveAwakeState({ ...next, wake });
+    await synchronizeMessages({ repair: true });
+    assertCorrectionCurrent(snapshot);
+    const synced = await trySyncWakePreset(wake, snapshot.session);
+    if (isCurrentSession(snapshot.session)) {
+        scheduleRender();
+        toastr.success(
+            `清醒记录已保存：${formatWakeTime(date, hour)}${synced ? '，预设已同步' : '，预设待同步'}。`,
+            SCRIPT_LABEL,
+        );
+    }
+    return { synced, anchorId: id };
+}
+
+function makeCorrectionForm(index) {
+    const doc = getParentDocument();
+    const element = (tag, text = '', className = '') => {
+        const item = doc.createElement(tag);
+        item.textContent = text;
+        item.className = className;
+        return item;
+    };
+    const form = element('div', '', CORRECTION_CLASS);
+    form.appendChild(element('h3', '清醒记录'));
+    const status = index.missingAnchor ? '计数已校正 · 原起点缺失'
+        : index.pending ? '计数已校正 · 等待下一条消息'
+            : index.currentCycleId ? `计数已校正 · 起点 #${index.startMessageId} · 本轮 #${index.currentCount} 条`
+                : '计数已校正 · 尚无清醒起点';
+    form.appendChild(element('p', status, 'amc-status'));
+    const modes = element('div', '', 'amc-modes');
+    const radios = {};
+    const currentId = index.pending?.kind === 'start' ? index.pending.id : index.currentCycleId;
+    const savedWake = normalizeAwakeState()?.wake;
+    const currentWake = savedWake?.anchor_id === currentId ? savedWake : null;
+    for (const [value, text] of [['new', '补记睡醒'], ['edit', '修改本轮']]) {
+        const label = element('label');
+        const radio = element('input');
+        radio.type = 'radio';
+        radio.name = 'amc-correction-mode';
+        radio.value = value;
+        radio.disabled = value === 'edit' && !currentId;
+        radios[value] = radio;
+        label.appendChild(radio);
+        label.appendChild(element('span', text));
+        modes.appendChild(label);
+    }
+    form.appendChild(modes);
+    const field = (parent, text, control) => {
+        const label = element('label');
+        label.appendChild(element('span', text));
+        control.classList.add('text_pole');
+        control.setAttribute('aria-label', text);
+        label.appendChild(control);
+        parent.appendChild(label);
+        return control;
+    };
+    const messages = field(form, '醒来后的第一条消息', element('select'));
+    const addOption = (select, value, text) => {
+        const option = element('option', text);
+        option.value = value;
+        select.appendChild(option);
+        return option;
+    };
+    addOption(messages, '', '选择消息');
+    const pendingOption = addOption(messages, 'pending', '下一条你发送的消息');
+    const previews = new Map();
+    const chat = getChat();
+    for (let id = chat.length - 1; id >= 0; id--) {
+        const message = chat[id];
+        if (message.is_user !== true || !isConversationMessage(message)) continue;
+        const preview = stripCoordinateTags(message.mes).replace(BOUNDARY_PATTERN, '').trim();
+        previews.set(String(id), preview.slice(0, 500));
+        addOption(messages, String(id), `#${id} ${preview.replace(/\s+/g, ' ').slice(0, 60)}`);
+    }
+    const preview = element('p', '', 'amc-preview');
+    form.appendChild(preview);
+    const row = element('div', '', 'amc-time-fields');
+    const dateInput = element('input');
+    dateInput.type = 'date';
+    dateInput.required = true;
+    const now = localWakeTime();
+    dateInput.max = now.date;
+    const date = field(row, '睡醒日期', dateInput);
+    const hour = field(row, '睡醒时间', element('select'));
+    addOption(hour, '', '选择小时');
+    for (let value = 0; value < 24; value++) addOption(hour, String(value), `${value}点`);
+    form.appendChild(row);
+    form.appendChild(element('p', `同步预设：${selectedPresetName() ?? '未选择'}`, 'amc-status'));
+    const error = element('p', '', 'amc-error');
+    error.setAttribute('role', 'alert');
+    form.appendChild(error);
+    const refreshPreview = () => { preview.textContent = previews.get(messages.value) ?? ''; };
+    const changeMode = () => {
+        const editing = radios.edit.checked;
+        messages.disabled = editing;
+        pendingOption.disabled = !editing;
+        messages.value = editing ? (index.pending?.kind === 'start' ? 'pending' : String(index.startMessageId)) : '';
+        date.value = editing && currentWake ? currentWake.date : now.date;
+        hour.value = editing && currentWake ? String(currentWake.hour) : '';
+        refreshPreview();
+        error.textContent = '';
+    };
+    radios.edit.checked = Boolean(currentId && (index.pending?.kind === 'start' || currentWake?.needs_sync));
+    radios.new.checked = !radios.edit.checked;
+    for (const radio of Object.values(radios)) radio.addEventListener('change', changeMode);
+    messages.addEventListener('change', refreshPreview);
+    changeMode();
+    return {
+        form, error,
+        read: () => ({
+            mode: radios.edit.checked ? 'edit' : 'new',
+            messageId: /^\d+$/.test(messages.value) ? Number(messages.value) : null,
+            date: date.value, hour: hour.value,
+        }),
+    };
 }
 
 async function inspectAwakeCounter() {
-    await synchronizeMessages({ repair: true });
+    if (!canStartAwakeAction()) return;
+    wakeAction = true;
+    const session = captureChatSession();
+    try {
+        await synchronizeMessages({ repair: true });
+        if (!isCurrentSession(session)) return;
+        const wake = normalizeAwakeState()?.wake;
+        if (wake?.needs_sync) await trySyncWakePreset(wake, session, { retry: true });
+        if (!isCurrentSession(session)) return;
+        await showCorrectionPopup();
+    } finally {
+        wakeAction = false;
+    }
+}
+
+async function showCorrectionPopup() {
     const { cycleIndex } = renderAllMessages();
     if (cycleIndex.missingAnchor) {
         toastr.warning('保存的起点标记已不在聊天里，未猜测新的起点。请恢复该消息，或点“我醒了”开始新周期。', '校正计数');
+    }
+    const context = getContext();
+    if (typeof context.Popup !== 'function') {
+        toastr.info('计数已校正；当前酒馆未提供补记窗口接口。', '校正计数');
         return;
     }
-    if (!cycleIndex.currentCycleId) {
-        toastr.info(cycleIndex.pending ? '已校正总编号；等待下一条你发送的消息保存标记。' : '已校正总编号；没有找到进行中的清醒起点。', '校正计数');
-        return;
+    const snapshot = correctionSnapshot();
+    const ui = makeCorrectionForm(cycleIndex);
+    let submitting = false;
+    const popup = new context.Popup(ui.form, context.POPUP_TYPE.TEXT, '', {
+        okButton: '保存睡醒记录', cancelButton: '关闭', leftAlign: true,
+        onClosing: async popup => {
+            if (disposed) return true;
+            if (submitting) return false;
+            if (popup.result !== context.POPUP_RESULT.AFFIRMATIVE) return true;
+            submitting = true;
+            ui.error.textContent = '';
+            popup.okButton.setAttribute('aria-disabled', 'true');
+            try {
+                await applyWakeCorrection(ui.read(), snapshot);
+                return true;
+            } catch (error) {
+                console.warn(`[${SCRIPT_LABEL}] 补记未完成。`, error);
+                ui.error.textContent = error.message;
+                return false;
+            } finally {
+                submitting = false;
+                popup.okButton.removeAttribute('aria-disabled');
+            }
+        },
+    });
+    correctionPopup = popup;
+    try {
+        await popup.show();
+    } finally {
+        if (correctionPopup === popup) correctionPopup = null;
     }
-    toastr.info(
-        `已从第 #${cycleIndex.startMessageId} 楼的清醒标记恢复；当前共 #${cycleIndex.currentCount} 条（包含隐藏的普通对话）。`,
-        '校正计数',
-    );
 }
 
 async function handleMessageChange(messageId, capturePending = false) {
+    chatRevision++;
     cycleCache = null;
     await synchronizeMessages({ messageId: Number.isInteger(messageId) ? messageId : null, capturePending });
     scheduleRender();
@@ -742,6 +1277,9 @@ function safely(handler) {
 
 function cleanup() {
     disposed = true;
+    if (correctionPopup) {
+        void correctionPopup.completeCancelled().catch(error => console.warn(`[${SCRIPT_LABEL}] 关闭补记窗口失败。`, error));
+    }
     chatObserver?.disconnect();
     chatObserver = null;
 
@@ -791,6 +1329,7 @@ for (const event of [tavern_events.TOOL_CALLS_PERFORMED, tavern_events.TOOL_CALL
     if (event) listenLast(event, safely(() => handleMessageChange()));
 }
 eventOn(tavern_events.CHAT_CHANGED, () => {
+    chatRevision++;
     cycleCache = null;
     void clearGenerationPrompt();
     scheduleRender();
