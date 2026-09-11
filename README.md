@@ -1,7 +1,26 @@
 # 消息编号与清醒周期（消息锚点版）
 
-SillyTavern + TavernHelper 脚本。v1.3.0 增加睡醒时间同步和补记，是未经真实聊天部署的测试发布。
+SillyTavern + TavernHelper 脚本。v1.4.0 增加长间隔后的睡醒询问，是未经真实聊天部署的测试发布。
 已核对实际安装的 SillyTavern 1.16.0 / TavernHelper 4.9.5 接口，并使用合成消息及浏览器夹具测试。
+
+## 长间隔提醒
+
+默认开启：在**当前聊天**里，你距离上次发言满 **8 小时**再发新消息时，弹窗询问“这次是睡醒了吗？”。
+不需要提前点按钮，也不需要自己选消息或移动标签。
+
+- 点“记录睡醒”：**刚发出的这一条**直接成为新周期的 `#1`，并同步预设睡醒时间。
+- 点“不是睡醒”或关闭弹窗：继续原来的周期，不改睡醒时间。这次发言不再重复询问。
+- 日期和小时默认填本次发言的本地时间；若更早就醒了，确认前直接修改。仍以你的确认为准，不自动认定你睡过。
+- “睡醒提醒”按钮可以把间隔改成 6 小时或其他 1 到 24 的整数小时，也可以关闭；设置保存在当前脚本中。
+
+弹窗前先保存刚发出的用户消息，再等待你的选择；确认后同一次回复即可使用更新的预设时间。
+不操作弹窗时，这次发送会等待；关闭弹窗即可继续原来的对话。已经点过“我醒了”或“结束清醒”时，不额外询问。
+只检查新发送的用户消息，刷新、切换聊天、翻历史、编辑消息和 Roll 不会补弹历史提醒。
+如果已经聊过几条才想起忘了记录，仍可使用下面的“校正计数”手动补记。
+
+与 `<idle>{{idleDuration}}</idle>` 使用同类的消息时间数据，但直接比较前后两条用户消息的原始发送时间，
+不解析四舍五入后的英文/中文间隔文本，也不修改时间或间隔正则。隐藏的普通用户消息仍作为上次发言；
+没有上次发言、时间缺失或无效时不猜测。它记录的是**发言间隔，不是睡眠时长**。
 
 ## 使用方式
 
@@ -96,7 +115,7 @@ npm test
 npm run build:entry -- <输出目录>
 ```
 
-输出 `awake-message-coordinates-entry.json` 和 `awake-message-coordinates-v1.3.0-local.json`。
+输出 `awake-message-coordinates-entry.json` 和 `awake-message-coordinates-v1.4.0-local.json`。
 后者内含完整代码，不需要 CDN。
 测试入口默认关闭。先备份测试聊天，停用旧“消息编号与清醒周期”脚本，再启用这一份；同类版本只能启用一个。
 测试细节和复现方法见 [tests/README.md](tests/README.md)。
@@ -104,17 +123,17 @@ npm run build:entry -- <输出目录>
 
 ## GitHub 更新
 
-在 [v1.3.0 测试发布](https://github.com/juxingmaomi/awake-message-coordinates/releases/tag/v1.3.0) 中：
+在 [v1.4.0 测试发布](https://github.com/juxingmaomi/awake-message-coordinates/releases/tag/v1.4.0) 中：
 
 - `awake-message-coordinates-entry.json` 是固定版本 CDN 入口。
-- `awake-message-coordinates-v1.3.0-local.json` 是自包含入口，默认关闭，不依赖 CDN。
+- `awake-message-coordinates-v1.4.0-local.json` 是自包含入口，默认关闭，不依赖 CDN。
 
 已经安装“版本入口”的用户无需重复导入；备份聊天后，把入口中的版本改为：
 
 ```js
-const VERSION = 'v1.3.0';
+const VERSION = 'v1.4.0';
 ```
 
-保存后刷新页面即可加载该版本。不要同时启用 CDN 入口和自包含入口。
+保存后刷新页面即可加载该版本，会自动补上“睡醒提醒”按钮。不要同时启用 CDN 入口和自包含入口。
 v1.2 的起点继续使用；更早的旧变量不会自动转换为正文锚点，请在下一次真正醒来时按“我醒了”建立起点。
 这次发布不代表已完成真实聊天中的全部第三方插件兼容性验证，建议先在聊天副本中试用。

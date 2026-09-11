@@ -24,14 +24,17 @@ function preset() {
 
 function node(tagName = 'div') {
     const classes = new Set();
+    const attributes = {};
     const value = {
-        tagName: tagName.toUpperCase(), id: '', children: [], textContent: '', parentNode: null,
+        tagName: tagName.toUpperCase(), id: '', children: [], textContent: '', parentNode: null, attributes,
         classList: {
             add: (...names) => names.forEach(name => classes.add(name)),
             remove: (...names) => names.forEach(name => classes.delete(name)),
             contains: name => classes.has(name),
         },
-        setAttribute() {}, closest: () => null, querySelector: () => null, querySelectorAll: () => [],
+        setAttribute(name, value) { attributes[name] = value; },
+        removeAttribute(name) { delete attributes[name]; },
+        addEventListener() {}, closest: () => null, querySelector: () => null, querySelectorAll: () => [],
         appendChild(child) { child.parentNode = this; this.children.push(child); },
         remove() {
             if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this);
@@ -47,6 +50,7 @@ function node(tagName = 'div') {
 function harness({
     chat = [], variables = {}, saveHook = null, presetHook = null,
     savedPreset = preset(), livePreset = null, now = new Date(2026, 8, 8, 13, 45).getTime(),
+    scriptVariables = {}, popupHook = null,
 } = {}) {
     const handlers = new Map();
     const frames = new Map();
@@ -57,6 +61,7 @@ function harness({
     const toasts = [];
     const presetSaves = [];
     const settingsSaves = [];
+    const popups = [];
     const presets = new Map([[PRESET_NAME, clone(savedPreset)]]);
     const disk = new Map([[PRESET_NAME, clone(savedPreset)]]);
     let selected = PRESET_NAME;
@@ -76,11 +81,16 @@ function harness({
         'TOOL_CALLS_PERFORMED', 'TOOL_CALLS_RENDERED',
     ].map(name => [name, name]));
     let currentVariables = clone(variables);
+    let currentScriptVariables = clone(scriptVariables);
     let frame = 0;
     const live = {
         chat, chatId: 'chat-a', characterId: 0, groupId: null,
         characters: [{ name: 'Synthetic character', avatar: 'synthetic.png' }],
         getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        timestampToMoment(value) {
+            const time = value == null || value === '' ? NaN : new Date(value).getTime();
+            return { isValid: () => Number.isFinite(time), valueOf: () => time };
+        },
         mainApi: 'openai', chatCompletionSettings: clone(livePreset ?? savedPreset),
         saveSettingsDebounced() { settingsSaves.push(clone(live.chatCompletionSettings)); },
         getPresetManager: api => {
@@ -125,6 +135,36 @@ function harness({
         requestAnimationFrame: callback => { frames.set(++frame, callback); return frame; },
         cancelAnimationFrame: id => frames.delete(id),
     };
+    if (popupHook) {
+        live.POPUP_TYPE = { TEXT: 1 };
+        live.POPUP_RESULT = { AFFIRMATIVE: 1, NEGATIVE: 0, CANCELLED: null };
+        live.Popup = class {
+            constructor(form, type, value, options) {
+                this.form = form;
+                this.options = options;
+                this.okButton = node('button');
+                popups.push(this);
+            }
+            show() {
+                this.promise = new Promise((resolve, reject) => {
+                    this.resolve = resolve;
+                    queueMicrotask(() => Promise.resolve(popupHook(this)).catch(reject));
+                });
+                return this.promise;
+            }
+            async complete(result) {
+                this.result = result;
+                if (await this.options.onClosing(this)) {
+                    this.closed = true;
+                    this.resolve(result);
+                    return result;
+                }
+                this.result = undefined;
+            }
+            completeCancelled() { return this.complete(null); }
+        };
+    }
+    const on = (event, callback) => handlers.set(event, [...(handlers.get(event) ?? []), callback]);
     const context = {
         console: { log() {}, warn() {}, error() {} }, document, window,
         structuredClone, AbortSignal,
@@ -134,16 +174,23 @@ function harness({
         },
         SillyTavern: { getContext: () => live },
         MutationObserver: class { observe() {} disconnect() {} },
-        getVariables: () => clone(currentVariables),
+        getVariables: option => {
+            assert.ok(['chat', 'script'].includes(option.type));
+            return clone(option.type === 'chat' ? currentVariables : currentScriptVariables);
+        },
         updateVariablesWith: (updater, option) => {
-            assert.equal(option.type, 'chat');
+            assert.ok(['chat', 'script'].includes(option.type));
+            if (option.type === 'script') {
+                currentScriptVariables = clone(updater(clone(currentScriptVariables)));
+                return clone(currentScriptVariables);
+            }
             currentVariables = clone(updater(clone(currentVariables)));
             return clone(currentVariables);
         },
         getButtonEvent: name => `button:${name}`,
         appendInexistentScriptButtons() {},
-        eventOn: (event, callback) => handlers.set(event, callback),
-        eventMakeLast: (event, callback) => handlers.set(event, callback),
+        eventOn: on,
+        eventMakeLast: on,
         tavern_events: events,
         toastr: Object.fromEntries(['info', 'success', 'warning', 'error'].map(type => [type, (...args) => toasts.push({ type, args })])),
         $(target) { if (typeof target === 'function') target(); return { on() {} }; },
@@ -152,9 +199,10 @@ function harness({
     vm.runInContext(source, context);
     return {
         api: context, live, document, textarea, prompts, saves, toasts, presets, disk, presetSaves, settingsSaves,
-        savedChats, chatReads,
+        savedChats, chatReads, popups,
         get variables() { return currentVariables; },
         set variables(value) { currentVariables = clone(value); },
+        get scriptVariables() { return currentScriptVariables; },
         setNow(value) { now = value; },
         switchPreset(name, value = preset()) {
             if (!presets.has(name)) {
@@ -166,7 +214,7 @@ function harness({
         },
         async emit(event, ...args) {
             assert.ok(handlers.has(event), `missing event ${event}`);
-            await handlers.get(event)(...args);
+            for (const handler of [...handlers.get(event)]) await handler(...args);
             const callbacks = [...frames.values()];
             frames.clear();
             for (const callback of callbacks) callback();
@@ -948,4 +996,339 @@ test('read-back uses the correct single/group identity and is not performed for 
             ? { url: '/api/chats/group/get', body: { id: 'saved-chat-name' } }
             : { url: '/api/chats/get', body: { ch_name: 'Synthetic character', file_name: 'saved-chat-name', avatar_url: 'synthetic.png' } });
     }
+});
+
+const REMINDER = 'st_awake_idle_reminder';
+const HOUR = 3600000;
+const REMINDER_NOW = new Date(2026, 8, 11, 13, 45).getTime();
+
+function control(form, label) {
+    if (form.attributes?.['aria-label'] === label) return form;
+    for (const child of form.children) {
+        const found = control(child, label);
+        if (found) return found;
+    }
+    return null;
+}
+
+function idleHarness({ gap = 8 * HOUR, ...options } = {}) {
+    const old = message(true, 0);
+    old.send_date = new Date(REMINDER_NOW - gap).toISOString();
+    old.mes += '\n\n<awake_start>amc-v1-previous</awake_start>';
+    const reply = message(false, 1);
+    reply.send_date = new Date(REMINDER_NOW - 60000).toISOString();
+    return harness({
+        chat: [old, reply], now: REMINDER_NOW,
+        variables: { [STATE]: { version: 3, mode: 'active', last_boundary_id: 'amc-v1-previous' } },
+        popupHook: popup => popup.complete(0),
+        ...options,
+    });
+}
+
+function newIdleMessage(at = REMINDER_NOW) {
+    const item = message(true, 2);
+    item.send_date = new Date(at).toISOString();
+    item.mes = 'Synthetic return.\n<time>13:45</time>\n<idle>8 hours</idle>';
+    return item;
+}
+
+test('idle preferences default to 8 hours and only persist in this script scope', () => {
+    const h = idleHarness({ scriptVariables: { unrelated: { keep: true } } });
+    assert.deepEqual(clone(h.api.getIdleReminderSettings()), { enabled: true, hours: 8 });
+    const before = clone(h.variables);
+    h.api.saveIdleReminderSettings(true, '6');
+    assert.deepEqual(h.scriptVariables, { unrelated: { keep: true }, [REMINDER]: { enabled: true, hours: 6 } });
+    h.api.saveIdleReminderSettings(false, 8);
+    assert.deepEqual(clone(h.api.getIdleReminderSettings()), { enabled: false, hours: 8 });
+    assert.deepEqual(h.variables, before);
+    for (const value of ['', 0, 25, -1, 6.5, NaN, 'bad']) {
+        assert.throws(() => h.api.saveIdleReminderSettings(true, value), /1 到 24/);
+    }
+    const malformed = idleHarness({ scriptVariables: { [REMINDER]: { hours: Infinity } } });
+    assert.equal(malformed.api.getIdleReminderSettings().hours, 8);
+});
+
+test('idle trigger uses exact user timestamps at the threshold, not rounded tags or the assistant time', async () => {
+    for (const [gap, hours, expected] of [
+        [8 * HOUR - 1, 8, 0], [8 * HOUR, 8, 1], [8 * HOUR + 1, 8, 1],
+        [6 * HOUR, 8, 0], [6 * HOUR, 6, 1], [24 * HOUR, 8, 1],
+    ]) {
+        const h = idleHarness({ gap, scriptVariables: { [REMINDER]: { enabled: true, hours } } });
+        await send(h, newIdleMessage());
+        assert.equal(h.popups.length, expected, `${gap}ms / ${hours}h`);
+        assert.equal(h.index().currentCount, 3);
+        assert.equal(h.presetSaves.length, 0);
+    }
+    const hidden = idleHarness();
+    hidden.live.chat[0].is_system = true;
+    await send(hidden, newIdleMessage());
+    assert.equal(hidden.popups.length, 1, 'hidden dialogue still has a real last-user timestamp');
+});
+
+test('invalid, backwards, future or absent timestamps never guess a sleep interval', async () => {
+    for (const value of [undefined, '', 'not a timestamp', '2026-09-12T00:00:00Z']) {
+        const h = idleHarness();
+        h.live.chat[0].send_date = value;
+        await send(h, newIdleMessage());
+        assert.equal(h.popups.length, 0);
+    }
+    for (const value of [undefined, 'invalid', new Date(REMINDER_NOW + HOUR).toISOString()]) {
+        const h = idleHarness();
+        const item = newIdleMessage();
+        item.send_date = value;
+        await send(h, item);
+        assert.equal(h.popups.length, 0);
+    }
+    const first = idleHarness({ chat: [] });
+    await send(first, newIdleMessage());
+    assert.equal(first.popups.length, 0);
+    const nearest = idleHarness();
+    nearest.live.chat.push({ ...newIdleMessage(), send_date: 'invalid' });
+    await send(nearest, newIdleMessage());
+    assert.equal(nearest.popups.length, 0, 'do not skip invalid recent records to use an older gap');
+});
+
+test('confirming idle during normal send synchronizes time and #1/#2 before the awaited event returns', async () => {
+    let h;
+    h = idleHarness({
+        popupHook: async popup => {
+            assert.equal(h.presetSaves.length, 0);
+            assert.equal(h.index().boundaries.length, 1);
+            const savedMessage = h.savedChats.get(h.live.chatId).chat[2];
+            assert.ok(savedMessage.mes.startsWith('Synthetic return.'));
+            assert.doesNotMatch(savedMessage.mes, /<awake_start>/);
+            coordinates(savedMessage.mes, 2, 3);
+            assert.equal(control(popup.form, '睡醒日期').value, '2026-09-11');
+            assert.equal(control(popup.form, '睡醒时间').value, '13');
+            assert.equal(popup.options.defaultResult, 0, 'Enter must not silently confirm sleep');
+            assert.throws(() => h.api.assertAwakeAvailable(), /回复结束/);
+            await popup.complete(1);
+        },
+    });
+    const before = metadata(h.live.chat);
+    h.textarea.value = 'Synthetic return.';
+    await h.emit('GENERATION_AFTER_COMMANDS', 'normal', {}, false);
+    h.textarea.value = '';
+    const item = newIdleMessage();
+    await send(h, item);
+    coordinates(item.mes, 2, 1);
+    assert.equal(h.index().boundaries.length, 2);
+    assert.equal(h.index().countsByCycle.get('amc-v1-previous'), 2);
+    assert.match(h.latestPrompt(), /本次清醒周期第 #2 条/);
+    assert.match(h.live.chatCompletionSettings.prompts[0].content, /9月11日 13点/);
+    assert.match(h.disk.get(PRESET_NAME).prompts[0].content, /9月11日 13点/);
+    assert.deepEqual(metadata(h.live.chat.slice(0, 2)), before);
+    assert.equal(h.variables[STATE].wake.needs_sync, false);
+    assert.equal(h.chatReads.length, 1);
+});
+
+test('decline, Escape and duplicate events do not start a cycle or re-prompt the same return', async () => {
+    for (const result of [0, null]) {
+        const h = idleHarness({ popupHook: popup => popup.complete(result) });
+        const before = clone(h.variables);
+        await send(h, newIdleMessage());
+        await h.emit('MESSAGE_SENT', 2);
+        h.setNow(REMINDER_NOW + 60000);
+        await send(h, newIdleMessage(REMINDER_NOW + 60000));
+        assert.equal(h.popups.length, 1);
+        assert.deepEqual(h.variables, before);
+        assert.equal(h.presetSaves.length, 0);
+        coordinates(h.live.chat.at(-1).mes, 3, 4);
+        h.setNow(REMINDER_NOW + 9 * HOUR);
+        await send(h, newIdleMessage(REMINDER_NOW + 9 * HOUR));
+        assert.equal(h.popups.length, 2, 'a later, separate long gap can be asked about');
+    }
+});
+
+test('manual wake/end, an existing new marker and a disabled reminder suppress duplicate prompting', async () => {
+    const wake = idleHarness();
+    await wake.wake();
+    const id = wake.variables[STATE].id;
+    await send(wake, newIdleMessage());
+    assert.equal(wake.popups.length, 0);
+    assert.equal(wake.variables[STATE].last_boundary_id, id);
+    assert.equal(wake.index().boundaries.length, 2);
+    const end = idleHarness();
+    await end.emit('button:结束清醒');
+    await send(end, newIdleMessage());
+    assert.equal(end.popups.length, 0);
+    const tagged = idleHarness();
+    const item = newIdleMessage();
+    item.mes += '\n\n<awake_start>amc-v1-existing-new</awake_start>';
+    await send(tagged, item);
+    assert.equal(tagged.popups.length, 0);
+    const off = idleHarness({ scriptVariables: { [REMINDER]: { enabled: false, hours: 8 } } });
+    await send(off, newIdleMessage());
+    assert.equal(off.popups.length, 0);
+});
+
+test('idle reminders do not run for quiet, automated, dry-run, continued or streamed generations', async () => {
+    for (const [type, options, dryRun] of [
+        ['quiet', {}, false], ['impersonate', {}, false], ['continue', {}, false],
+        ['regenerate', {}, false], ['swipe', {}, false], ['normal', { automatic_trigger: true }, false],
+        ['normal', {}, true], ['normal', { quiet_prompt: 'hidden' }, false],
+    ]) {
+        const h = idleHarness();
+        await h.emit('GENERATION_AFTER_COMMANDS', type, options, dryRun);
+        if (dryRun || ['quiet', 'impersonate'].includes(type) || options.quiet_prompt) {
+            // These native request paths do not emit MESSAGE_SENT.
+            await h.emit('MESSAGE_RECEIVED', 1);
+        } else {
+            await send(h, newIdleMessage());
+        }
+        assert.equal(h.popups.length, 0, type);
+    }
+    const streaming = idleHarness();
+    streaming.live.streamingProcessor = { isFinished: false, isStopped: false };
+    await send(streaming, newIdleMessage());
+    assert.equal(streaming.popups.length, 0);
+});
+
+test('load, edit, swipe, received messages and old-history replay never open an idle reminder', async () => {
+    const h = idleHarness();
+    await h.emit('MESSAGE_SENT', 0);
+    await h.emit('MESSAGE_EDITED', 0);
+    await h.emit('MESSAGE_UPDATED', 0);
+    await h.emit('MESSAGE_SWIPED', 1);
+    await h.emit('MORE_MESSAGES_LOADED');
+    await send(h, { ...newIdleMessage(), is_user: false });
+    assert.equal(h.popups.length, 0);
+    const imported = newIdleMessage();
+    h.live.chat.push(imported);
+    await h.emit('CHAT_CHANGED');
+    await h.emit('MESSAGE_SENT', 3);
+    assert.equal(h.popups.length, 0);
+    const reload = idleHarness({ chat: clone(h.live.chat), scriptVariables: { [REMINDER]: { enabled: true, hours: 6 } } });
+    await reload.emit('MESSAGE_SENT', 3);
+    assert.equal(reload.popups.length, 0);
+    assert.equal(reload.api.getIdleReminderSettings().hours, 6);
+});
+
+test('idle date/hour can be corrected, but invalid or later-than-message wake time does not partially save', async () => {
+    let h;
+    h = idleHarness({ popupHook: async popup => {
+        const date = control(popup.form, '睡醒日期');
+        const hour = control(popup.form, '睡醒时间');
+        for (const [day, value] of [['2026-02-30', '12'], ['', '12'], ['2026-09-11', '24']]) {
+            date.value = day;
+            hour.value = value;
+            await popup.complete(1);
+            assert.equal(popup.closed, undefined);
+            assert.equal(h.index().boundaries.length, 1);
+        }
+        h.setNow(REMINDER_NOW + 2 * HOUR);
+        date.value = '2026-09-11';
+        hour.value = '14';
+        await popup.complete(1);
+        assert.equal(popup.closed, undefined);
+        assert.equal(h.index().boundaries.length, 1);
+        hour.value = '0';
+        await popup.complete(1);
+    } });
+    await send(h, newIdleMessage());
+    assert.match(h.live.chatCompletionSettings.prompts[0].content, /9月11日 0点/);
+    coordinates(h.live.chat[2].mes, 2, 1);
+});
+
+test('idle chat-save failure leaves one retryable anchor and never prematurely updates the preset', async () => {
+    let fail = true;
+    let h;
+    h = idleHarness({
+        saveHook: () => !fail,
+        popupHook: async popup => {
+            await popup.complete(1);
+            assert.equal(popup.closed, undefined);
+            assert.equal(h.variables[STATE].mode, 'pending');
+            assert.equal(h.presetSaves.length, 0);
+            fail = false;
+            await popup.complete(1);
+        },
+    });
+    await send(h, newIdleMessage());
+    assert.equal(h.index().boundaries.length, 2);
+    assert.equal((h.live.chat[2].mes.match(/<awake_start>/g) ?? []).length, 1);
+    assert.equal(h.variables[STATE].wake.needs_sync, false);
+});
+
+test('idle preset-save failure retains the new live time and reports a retryable sync state', async () => {
+    const h = idleHarness({
+        presetHook: () => { throw new Error('synthetic save failure'); },
+        popupHook: popup => popup.complete(1),
+    });
+    await send(h, newIdleMessage());
+    coordinates(h.live.chat[2].mes, 2, 1);
+    assert.equal(h.variables[STATE].wake.needs_sync, true);
+    assert.match(h.live.chatCompletionSettings.prompts[0].content, /9月11日 13点/);
+    assert.match(h.disk.get(PRESET_NAME).prompts[0].content, /2026年9月7日/);
+    assert.ok(h.toasts.some(toast => toast.type === 'warning'));
+});
+
+test('switching chat while an idle prompt is open cancels it without writing the destination', async () => {
+    let h;
+    const destination = [message(true, 99)];
+    const before = clone(destination);
+    h = idleHarness({ popupHook: async () => {
+        h.live.chatId = 'destination';
+        h.live.chat = destination;
+        h.variables = { unrelated: 'destination' };
+        await h.emit('CHAT_CHANGED');
+    } });
+    await send(h, newIdleMessage());
+    assert.deepEqual(destination, before);
+    assert.deepEqual(h.variables, { unrelated: 'destination' });
+    assert.equal(h.presetSaves.length, 0);
+    assert.equal(h.popups[0].closed, true);
+});
+
+test('preset change and message edits invalidate an open reminder without changing wake time', async () => {
+    let h;
+    h = idleHarness({ popupHook: async popup => {
+        h.switchPreset('Other preset');
+        await popup.complete(1);
+        assert.equal(popup.closed, undefined);
+        assert.equal(h.presetSaves.length, 0);
+        await popup.complete(0);
+    } });
+    await send(h, newIdleMessage());
+    assert.equal(h.index().boundaries.length, 1);
+    const edit = idleHarness({ popupHook: async () => {
+        edit.live.chat[2].mes += '\nEdited.';
+        await edit.emit('MESSAGE_EDITED', 2);
+    } });
+    await send(edit, newIdleMessage());
+    assert.equal(edit.popups[0].closed, true);
+    assert.equal(edit.index().boundaries.length, 1);
+});
+
+test('a stopped generation closes the idle prompt and keeps the existing cycle', async () => {
+    let h;
+    h = idleHarness({ popupHook: () => h.emit('GENERATION_STOPPED') });
+    await h.emit('GENERATION_AFTER_COMMANDS', 'normal', {}, false);
+    await send(h, newIdleMessage());
+    assert.equal(h.popups[0].closed, true);
+    assert.equal(h.index().boundaries.length, 1);
+    assert.equal(h.presetSaves.length, 0);
+    assert.equal(h.latestPrompt(), '');
+});
+
+test('concurrent duplicate events or clicks while idle confirmation saves cannot create two cycles', async () => {
+    let release;
+    const pendingSave = new Promise(resolve => { release = resolve; });
+    let h;
+    h = idleHarness({
+        presetHook: () => pendingSave,
+        popupHook: async popup => {
+            const saving = popup.complete(1);
+            while (!h.variables[STATE].wake) await Promise.resolve();
+            await h.emit('MESSAGE_SENT', 2);
+            await popup.complete(1);
+            assert.equal(popup.closed, undefined);
+            release();
+            await saving;
+        },
+    });
+    await send(h, newIdleMessage());
+    assert.equal(h.popups.length, 1);
+    assert.equal(h.index().boundaries.length, 2);
+    assert.equal(h.presetSaves.length, 1);
 });

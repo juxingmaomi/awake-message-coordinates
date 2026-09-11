@@ -41,7 +41,7 @@ module.exports = async function ({ page, source, viewport, assert }) {
         .popup-controls { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; margin-top:20px; }
         #script-frame,#send_textarea { display:none; }
     </style></head><body>
-        <header><button id="wake">我醒了</button><button id="correct">校正计数</button><button id="end">结束清醒</button></header>
+        <header><button id="wake">我醒了</button><button id="correct">校正计数</button><button id="end">结束清醒</button><button id="reminder">睡醒提醒</button></header>
         <main id="chat"></main><textarea id="send_textarea"></textarea>
         <template id="popup_template" popup-button-cancel="Cancel">
             <dialog class="popup"><div class="popup-body"><div class="popup-content"></div>
@@ -56,8 +56,9 @@ module.exports = async function ({ page, source, viewport, assert }) {
     await page.evaluate(() => {
         const listeners = new Map();
         window.fixture = {
-            listeners, variables: {}, requests: [], chatReads: [], toasts: [], selected: 'Synthetic preset A',
+            listeners, variables: {}, scriptVariables: {}, requests: [], chatReads: [], toasts: [], selected: 'Synthetic preset A',
             failPreset: false, settingsSnapshot: null, chatSnapshot: null,
+            now: new Date(2026, 8, 8, 13, 45).getTime(),
         };
         const f = window.fixture;
         const preset = {
@@ -102,10 +103,15 @@ module.exports = async function ({ page, source, viewport, assert }) {
         };
         window.SillyTavern = { getContext: () => window.live };
         window.getVariables = ({ type }) => {
+            if (type === 'script') return structuredClone(f.scriptVariables);
             if (type !== 'chat') throw new Error(`Unsupported variable scope ${type}`);
             return structuredClone(f.variables);
         };
         window.updateVariablesWith = (updater, { type }) => {
+            if (type === 'script') {
+                f.scriptVariables = structuredClone(updater(structuredClone(f.scriptVariables)));
+                return structuredClone(f.scriptVariables);
+            }
             if (type !== 'chat') throw new Error(`Unsupported variable scope ${type}`);
             f.variables = structuredClone(updater(structuredClone(f.variables)));
             queueMicrotask(() => window.live.saveChat());
@@ -138,7 +144,7 @@ module.exports = async function ({ page, source, viewport, assert }) {
             if (typeof target === 'function') target();
             return { on: (event, handler) => target.addEventListener(event, handler) };
         };
-        for (const [id, name] of [['wake', '我醒了'], ['correct', '校正计数'], ['end', '结束清醒']]) {
+        for (const [id, name] of [['wake', '我醒了'], ['correct', '校正计数'], ['end', '结束清醒'], ['reminder', '睡醒提醒']]) {
             document.getElementById(id).addEventListener('click', () => { f.uiWork = window.emit(`button:${name}`); });
         }
         window.makeMessage = id => {
@@ -225,10 +231,9 @@ module.exports = async function ({ page, source, viewport, assert }) {
                 'appendInexistentScriptButtons', 'eventOn', 'eventMakeLast', 'tavern_events', 'toastr', '$',
             ]) window[key] = window.parent[key];
             const NativeDate = Date;
-            const now = new NativeDate(2026, 8, 8, 13, 45).getTime();
             window.Date = class extends NativeDate {
-                constructor(...args) { super(...(args.length ? args : [now])); }
-                static now() { return now; }
+                constructor(...args) { super(...(args.length ? args : [window.parent.fixture.now])); }
+                static now() { return window.parent.fixture.now; }
             };
         });
         await frame.addScriptTag({ content: source });
@@ -398,6 +403,10 @@ module.exports = async function ({ page, source, viewport, assert }) {
     assert.equal(result.controlsFit, true);
     result.nativePopupSha256 = createHash('sha256').update(popupSource).digest('hex');
     result.nativePresetManagerSha256 = createHash('sha256').update(presetSource).digest('hex');
-    result.coverage = 'Real plugin iframe, native Popup and savePreset; synthetic chat, server, settings scheduler and helper APIs. No full generation pipeline or paid model request.';
+    await closeCorrection();
+    result.idleReminder = await require('./idle-browser.cjs')({
+        page, assert, scriptFrame, loadScriptFrame, dialog, save, close, date, hour,
+    });
+    result.coverage = 'Real plugin iframe, native Popup, savePreset, sendMessageAsUser and timestamp parser; synthetic chat, server, regex, request continuation, settings scheduler and helper APIs. No full model request or paid call.';
     return result;
 };
